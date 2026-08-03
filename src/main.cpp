@@ -75,43 +75,6 @@ enum IconId : uint8_t {
   ICON_COUNT
 };
 
-// Unicode glyph for the web UI - purely cosmetic there (browsers render
-// these natively), kept conceptually matched to the on-device vector icon.
-const char* iconGlyph(uint8_t id) {
-  switch (id) {
-    case ICON_UP: return "\xE2\x86\x91";       // ↑
-    case ICON_DOWN: return "\xE2\x86\x93";     // ↓
-    case ICON_LEFT: return "\xE2\x86\x90";     // ←
-    case ICON_RIGHT: return "\xE2\x86\x92";    // →
-    case ICON_PLUS: return "+";
-    case ICON_MINUS: return "\xE2\x88\x92";    // −
-    case ICON_CHECK: return "\xE2\x9C\x93";    // ✓
-    case ICON_X: return "\xE2\x9C\x95";        // ✕
-    case ICON_POWER: return "\xE2\x8F\xBB";    // ⏻
-    case ICON_WIFI: return "\xF0\x9F\x93\xB6"; // 📶
-    case ICON_0: return "0"; case ICON_1: return "1"; case ICON_2: return "2";
-    case ICON_3: return "3"; case ICON_4: return "4"; case ICON_5: return "5";
-    case ICON_6: return "6"; case ICON_7: return "7"; case ICON_8: return "8";
-    case ICON_9: return "9";
-    default: return "";
-  }
-}
-
-const char* iconName(uint8_t id) {
-  switch (id) {
-    case ICON_UP: return "Up"; case ICON_DOWN: return "Down";
-    case ICON_LEFT: return "Left"; case ICON_RIGHT: return "Right";
-    case ICON_PLUS: return "Plus"; case ICON_MINUS: return "Minus";
-    case ICON_CHECK: return "Check"; case ICON_X: return "X";
-    case ICON_POWER: return "Power"; case ICON_WIFI: return "WiFi";
-    case ICON_0: return "0"; case ICON_1: return "1"; case ICON_2: return "2";
-    case ICON_3: return "3"; case ICON_4: return "4"; case ICON_5: return "5";
-    case ICON_6: return "6"; case ICON_7: return "7"; case ICON_8: return "8";
-    case ICON_9: return "9";
-    default: return "(none)";
-  }
-}
-
 // Draws icon `id` centered in the box (x,y,w,h). Every shape is computed
 // proportionally from the box size, not fixed pixel offsets, so this works
 // regardless of the exact cell size passed in (slots and remote buttons
@@ -504,10 +467,11 @@ IRCode captureCurrent() {
 // is the app's home view - build whatever layout you want, not limited to
 // what fits on the physical hardware.
 struct RemoteButton {
-  String name;
-  String codeName;
-  uint8_t icon;
-  CRGB color;
+  String name;             // optional - only used in the edit list & MQTT entity naming, never shown on the tile
+  String codeName;         // "" = no code assigned yet
+  uint8_t icon = ICON_NONE;
+  CRGB color = DEFAULT_SLOT_COLOR;
+  bool spacer = false;     // true = an invisible layout-only placeholder tile, not a real button
 };
 std::vector<RemoteButton> remoteButtons;
 int remoteColumns = 3;
@@ -554,6 +518,7 @@ bool saveProfile() {
     bObj["code"] = b.codeName;
     bObj["icon"] = b.icon;
     bObj["color"] = colorToHex(b.color);
+    bObj["spacer"] = b.spacer;
   }
   doc["remoteColumns"] = remoteColumns;
 
@@ -678,6 +643,7 @@ bool loadProfile() {
     b.icon = bObj["icon"] | (int)ICON_NONE;
     const char* bColorHex = bObj["color"].as<const char*>();
     b.color = bColorHex ? parseHexColor(bColorHex, DEFAULT_SLOT_COLOR) : DEFAULT_SLOT_COLOR;
+    b.spacer = bObj["spacer"] | false;  // missing (pre-spacer saves) = false
     remoteButtons.push_back(b);
   }
   remoteColumns = doc["remoteColumns"] | 3;
@@ -749,12 +715,13 @@ String mqttSlug(const String &s) {
 }
 
 // removes one remote button's HA entity - an empty retained payload on its
-// discovery topic tells HA to forget it. Call before a button is
-// renamed/deleted so it doesn't leave a stale duplicate behind.
-void mqttClearDiscovery(const String &buttonName) {
+// discovery topic tells HA to forget it. Call before a button's code
+// changes/is deleted so it doesn't leave a stale duplicate behind. Keyed by
+// codeName (see mqttPublishDiscovery) since name is optional and often blank.
+void mqttClearDiscovery(const String &codeName) {
   if (!mqttClient.connected()) return;
   String deviceId = "irhomebase_" + String(hostname);
-  String topic = "homeassistant/button/" + deviceId + "_" + mqttSlug(buttonName) + "/config";
+  String topic = "homeassistant/button/" + deviceId + "_" + mqttSlug(codeName) + "/config";
   mqttClient.publish(topic.c_str(), "", true);
 }
 
@@ -762,9 +729,16 @@ void mqttPublishDiscovery() {
   if (!mqttClient.connected()) return;
   String deviceId = "irhomebase_" + String(hostname);
   for (auto &b : remoteButtons) {
+    // spacers and buttons with no code assigned yet have nothing to expose
+    // to HA (name is optional now, so mqttSlug(b.name) alone could also
+    // collide across several nameless buttons - key off the code name,
+    // which is always unique in codeLibrary, instead)
+    if (b.spacer || b.codeName.length() == 0) continue;
+    String displayName = b.name.length() ? b.name : b.codeName;
+
     JsonDocument doc;
-    doc["name"] = b.name;
-    doc["unique_id"] = deviceId + "_" + mqttSlug(b.name);
+    doc["name"] = displayName;
+    doc["unique_id"] = deviceId + "_" + mqttSlug(b.codeName);
     doc["command_topic"] = mqttCmdTopic();
     doc["payload_press"] = b.codeName;
     doc["availability_topic"] = mqttStatusTopic();
@@ -775,7 +749,7 @@ void mqttPublishDiscovery() {
 
     String payload;
     serializeJson(doc, payload);
-    String topic = "homeassistant/button/" + deviceId + "_" + mqttSlug(b.name) + "/config";
+    String topic = "homeassistant/button/" + deviceId + "_" + mqttSlug(b.codeName) + "/config";
     mqttClient.publish(topic.c_str(), payload.c_str(), true);
   }
 }
@@ -940,7 +914,8 @@ void handleApiState() {
     json += "{\"name\":\"" + jsonEscape(b.name) + "\",";
     json += "\"code\":\"" + jsonEscape(b.codeName) + "\",";
     json += "\"icon\":" + String(b.icon) + ",";
-    json += "\"color\":\"" + colorToHex(b.color) + "\"}";
+    json += "\"color\":\"" + colorToHex(b.color) + "\",";
+    json += "\"spacer\":" + String(b.spacer ? "true" : "false") + "}";
   }
   json += "]}";
 
@@ -968,7 +943,7 @@ static const char PAGE_HTML[] PROGMEM = R"HTML(<!doctype html>
   #statusBar { position:sticky; top:8px; background:#1a7a3a; color:#fff; padding:12px; border-radius:10px; margin-bottom:14px; font-weight:600; text-align:center; z-index:5; }
   #statusBar.learning { background:#a06a00; }
   .item { display:flex; align-items:center; gap:6px; background:#1c1c1c; border-radius:10px; padding:10px; margin-bottom:8px; flex-wrap:wrap; }
-  .item .name { flex:1 1 auto; min-width:70px; font-size:1rem; word-break:break-all; }
+  .item .name, .item .label { flex:1 1 auto; min-width:70px; font-size:1rem; word-break:break-all; }
   .empty { color:#888; font-size:0.9rem; }
   button { font-size:0.95rem; padding:10px 14px; border-radius:8px; border:none; background:#2a7a4a; color:#fff; }
   button.secondary { background:#3a4a6a; }
@@ -985,8 +960,14 @@ static const char PAGE_HTML[] PROGMEM = R"HTML(<!doctype html>
   .tabPanel { display:none; }
   .tabPanel.active { display:block; }
   #remoteGrid { display:grid; gap:8px; margin-bottom:16px; }
-  .remoteTile { aspect-ratio:1.4; font-size:1.4rem; border-radius:12px; display:flex; align-items:center; justify-content:center; text-align:center; padding:6px; overflow:hidden; }
-  .remoteTile .tileLabel { font-size:0.65rem; opacity:0.85; }
+  .remoteTile { aspect-ratio:1.3; font-size:0.85rem; font-weight:600; border-radius:12px; display:flex; align-items:center; justify-content:center; text-align:center; padding:4px; overflow:hidden; border:none; }
+  .remoteTile svg { width:46%; height:46%; }
+  .remoteTile.spacer { background:transparent !important; border:1px dashed #3a3a3a; pointer-events:none; }
+  .iconPreview { width:34px; height:34px; border-radius:8px; display:flex; align-items:center; justify-content:center; flex:0 0 auto; font-weight:700; font-size:0.95rem; }
+  .iconPreview svg { width:60%; height:60%; }
+  .editRow { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+  .editRow .label { flex:1 1 90px; min-width:70px; }
+  .editRow .moveDelBtns { display:flex; gap:6px; margin-left:auto; }
 </style>
 </head>
 <body>
@@ -1017,12 +998,18 @@ static const char PAGE_HTML[] PROGMEM = R"HTML(<!doctype html>
   <div id='remoteList'></div>
 
   <h3>Add button</h3>
+  <p class='empty'>Pick a symbol and color - a code is optional if you just want to lay a button out first and hook it up later.</p>
   <form class='inline' id='remoteAddForm'>
-    <input type='text' id='remoteAddName' placeholder='button name' autocomplete='off'>
+    <div class='editRow'>
+      <div class='iconPreview' id='remoteAddPreview'></div>
+      <select id='remoteAddIcon'></select>
+      <input type='color' id='remoteAddColor'>
+    </div>
     <select id='remoteAddCode'></select>
-    <select id='remoteAddIcon'></select>
-    <input type='color' id='remoteAddColor'>
-    <button type='submit'>Add</button>
+    <div class='editRow'>
+      <button type='submit'>Add button</button>
+      <button type='button' class='secondary' id='remoteAddSpacerBtn'>Add empty space</button>
+    </div>
   </form>
 </div>
 
@@ -1081,26 +1068,52 @@ static const char PAGE_HTML[] PROGMEM = R"HTML(<!doctype html>
 
 <script>
 // Icon ids must match the IconId enum in main.cpp exactly (order = value).
+// Drawn as inline SVG (fill/stroke: currentColor) rather than Unicode glyphs -
+// glyph font coverage is inconsistent across phones/browsers (the power
+// symbol U+23FB in particular doesn't render on a lot of devices), so this
+// is what actually shows up reliably instead of a blank box. Digits are
+// plain text since digit glyphs render fine everywhere.
 const ICONS = [
-  {id:0, glyph:'', name:'(none)'},
-  {id:1, glyph:'↑', name:'Up'},
-  {id:2, glyph:'↓', name:'Down'},
-  {id:3, glyph:'←', name:'Left'},
-  {id:4, glyph:'→', name:'Right'},
-  {id:5, glyph:'+', name:'Plus'},
-  {id:6, glyph:'−', name:'Minus'},
-  {id:7, glyph:'✓', name:'Check'},
-  {id:8, glyph:'✕', name:'X'},
-  {id:9, glyph:'⏻', name:'Power'},
-  {id:10, glyph:'📶', name:'WiFi'},
-  {id:11, glyph:'0', name:'0'}, {id:12, glyph:'1', name:'1'}, {id:13, glyph:'2', name:'2'},
-  {id:14, glyph:'3', name:'3'}, {id:15, glyph:'4', name:'4'}, {id:16, glyph:'5', name:'5'},
-  {id:17, glyph:'6', name:'6'}, {id:18, glyph:'7', name:'7'}, {id:19, glyph:'8', name:'8'},
-  {id:20, glyph:'9', name:'9'}
+  {id:0, name:'(none)', svg:null},
+  {id:1, name:'Up', svg:'<svg viewBox="0 0 24 24"><polygon points="12,4 4,18 20,18" fill="currentColor"/></svg>'},
+  {id:2, name:'Down', svg:'<svg viewBox="0 0 24 24"><polygon points="12,20 4,6 20,6" fill="currentColor"/></svg>'},
+  {id:3, name:'Left', svg:'<svg viewBox="0 0 24 24"><polygon points="4,12 18,4 18,20" fill="currentColor"/></svg>'},
+  {id:4, name:'Right', svg:'<svg viewBox="0 0 24 24"><polygon points="20,12 6,4 6,20" fill="currentColor"/></svg>'},
+  {id:5, name:'Plus', svg:'<svg viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="4" fill="currentColor"/><rect x="10" y="4" width="4" height="16" fill="currentColor"/></svg>'},
+  {id:6, name:'Minus', svg:'<svg viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="4" fill="currentColor"/></svg>'},
+  {id:7, name:'Check', svg:'<svg viewBox="0 0 24 24"><polyline points="4,13 9,18 20,6" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>'},
+  {id:8, name:'X', svg:'<svg viewBox="0 0 24 24"><line x1="5" y1="5" x2="19" y2="19" stroke="currentColor" stroke-width="3" stroke-linecap="round"/><line x1="19" y1="5" x2="5" y2="19" stroke="currentColor" stroke-width="3" stroke-linecap="round"/></svg>'},
+  {id:9, name:'Power', svg:'<svg viewBox="0 0 24 24"><path d="M18.36 6.64a9 9 0 1 1-12.73 0" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><line x1="12" y1="2" x2="12" y2="12" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>'},
+  {id:10, name:'WiFi', svg:'<svg viewBox="0 0 24 24"><rect x="2" y="15" width="3" height="6" fill="currentColor"/><rect x="8" y="11" width="3" height="10" fill="currentColor"/><rect x="14" y="7" width="3" height="14" fill="currentColor"/><rect x="20" y="3" width="3" height="18" fill="currentColor"/></svg>'},
+  {id:11, name:'0', svg:null}, {id:12, name:'1', svg:null}, {id:13, name:'2', svg:null},
+  {id:14, name:'3', svg:null}, {id:15, name:'4', svg:null}, {id:16, name:'5', svg:null},
+  {id:17, name:'6', svg:null}, {id:18, name:'7', svg:null}, {id:19, name:'8', svg:null},
+  {id:20, name:'9', svg:null}
 ];
-function iconGlyph(id) {
-  const found = ICONS.find(function (i) { return i.id === id; });
-  return found ? found.glyph : '';
+function findIcon(id) { return ICONS.find(function (i) { return i.id === id; }); }
+
+// Renders icon `id` into `el` (any block element) tinted `colorHex`. Works
+// for both the small edit-list preview swatches and the big remote tiles -
+// caller controls size via CSS, this just fills in the right markup/color.
+function paintIcon(el, id, colorHex) {
+  el.innerHTML = '';
+  el.style.color = colorHex;
+  const icon = findIcon(id);
+  if (icon && icon.svg) {
+    el.innerHTML = icon.svg;
+  } else if (icon && id >= 11 && id <= 20) {
+    el.textContent = icon.name;
+  }
+}
+
+// Picks black or white so text/icons stay legible against an arbitrary
+// user-chosen background color - mirrors contrastTextColor() in main.cpp so
+// the web preview matches what actually shows up on the device's screen.
+function contrastColor(hex) {
+  const h = hex.replace('#', '');
+  const r = parseInt(h.substring(0, 2), 16), g = parseInt(h.substring(2, 4), 16), b = parseInt(h.substring(4, 6), 16);
+  const luminance = (r * 299 + g * 587 + b * 114) / 1000;
+  return luminance > 140 ? '#000' : '#fff';
 }
 
 document.querySelectorAll('.tabBtn').forEach(function (btn) {
@@ -1167,7 +1180,7 @@ function fillIconSelect(select, selected) {
   ICONS.forEach(function (icon) {
     const opt = document.createElement('option');
     opt.value = String(icon.id);
-    opt.textContent = (icon.glyph ? icon.glyph + ' ' : '') + icon.name;
+    opt.textContent = icon.name;
     if (icon.id === selected) opt.selected = true;
     select.appendChild(opt);
   });
@@ -1229,17 +1242,24 @@ document.getElementById('remoteColumnsSel').addEventListener('change', function 
 
 document.getElementById('remoteAddForm').addEventListener('submit', function (e) {
   e.preventDefault();
-  const nameInput = document.getElementById('remoteAddName');
-  const name = nameInput.value.trim();
-  if (!name) return;
   mutate('/remote/add', {
-    name: name,
     code: document.getElementById('remoteAddCode').value,
     icon: document.getElementById('remoteAddIcon').value,
     color: document.getElementById('remoteAddColor').value
   });
-  nameInput.value = '';
 });
+document.getElementById('remoteAddSpacerBtn').addEventListener('click', function () {
+  mutate('/remote/add', {spacer: '1'});
+});
+function updateAddPreview() {
+  const preview = document.getElementById('remoteAddPreview');
+  const color = document.getElementById('remoteAddColor').value;
+  preview.style.background = color;
+  paintIcon(preview, parseInt(document.getElementById('remoteAddIcon').value, 10), contrastColor(color));
+}
+document.getElementById('remoteAddIcon').addEventListener('change', updateAddPreview);
+document.getElementById('remoteAddColor').addEventListener('change', updateAddPreview);
+document.getElementById('remoteAddColor').addEventListener('input', updateAddPreview);
 
 function renderRemote(state) {
   const colSel = document.getElementById('remoteColumnsSel');
@@ -1254,21 +1274,17 @@ function renderRemote(state) {
   state.remote.forEach(function (b) {
     const tile = document.createElement('button');
     tile.type = 'button';
-    tile.className = 'remoteTile';
+    tile.className = 'remoteTile' + (b.spacer ? ' spacer' : '');
+    if (b.spacer) {
+      grid.appendChild(tile);
+      return;
+    }
     tile.style.background = b.color;
-    tile.style.color = '#fff';
-    const glyph = iconGlyph(b.icon);
-    if (glyph) {
-      tile.innerHTML = '';
-      const g = document.createElement('div');
-      g.textContent = glyph;
-      tile.appendChild(g);
-      const l = document.createElement('div');
-      l.className = 'tileLabel';
-      l.textContent = b.name;
-      tile.appendChild(l);
-    } else {
-      tile.textContent = b.name;
+    if (b.icon) {
+      paintIcon(tile, b.icon, contrastColor(b.color));
+    } else if (b.code) {
+      tile.textContent = b.code;
+      tile.style.color = contrastColor(b.color);
     }
     tile.addEventListener('click', function () { if (b.code) blastCode(b.code); });
     grid.appendChild(tile);
@@ -1278,36 +1294,60 @@ function renderRemote(state) {
   list.innerHTML = '';
   state.remote.forEach(function (b, i) {
     const row = document.createElement('div');
-    row.className = 'item';
+    row.className = 'item editRow';
 
-    const nameInput = document.createElement('input');
-    nameInput.type = 'text';
-    nameInput.value = b.name;
-    nameInput.style.flex = '1 1 100px';
-    nameInput.addEventListener('change', function () { mutate('/remote/update', {index: String(i), name: nameInput.value}); });
-    row.appendChild(nameInput);
+    if (b.spacer) {
+      const label = document.createElement('span');
+      label.className = 'label empty';
+      label.textContent = 'Empty space';
+      row.appendChild(label);
+      const btns = document.createElement('div');
+      btns.className = 'moveDelBtns';
+      btns.appendChild(makeButton('↑', 'secondary', function () { mutate('/remote/move', {index: String(i), dir: 'up'}); }));
+      btns.appendChild(makeButton('↓', 'secondary', function () { mutate('/remote/move', {index: String(i), dir: 'down'}); }));
+      btns.appendChild(makeButton('Delete', 'danger', function () { mutate('/remote/delete', {index: String(i)}); }));
+      row.appendChild(btns);
+      list.appendChild(row);
+      return;
+    }
+
+    const preview = document.createElement('div');
+    preview.className = 'iconPreview';
+    paintIcon(preview, b.icon, contrastColor(b.color));
+    preview.style.background = b.color;
+    row.appendChild(preview);
+
+    const iconSel = document.createElement('select');
+    fillIconSelect(iconSel, b.icon);
+    iconSel.addEventListener('change', function () {
+      paintIcon(preview, parseInt(iconSel.value, 10), contrastColor(colorInput.value));
+      mutate('/remote/update', {index: String(i), icon: iconSel.value});
+    });
+    row.appendChild(iconSel);
+
+    const colorInput = document.createElement('input');
+    colorInput.type = 'color';
+    colorInput.value = b.color;
+    colorInput.addEventListener('input', function () {
+      preview.style.background = colorInput.value;
+      paintIcon(preview, parseInt(iconSel.value, 10), contrastColor(colorInput.value));
+    });
+    colorInput.addEventListener('change', function () { mutate('/remote/update', {index: String(i), color: colorInput.value}); });
+    row.appendChild(colorInput);
 
     const codeSel = document.createElement('select');
     fillCodeSelect(codeSel, state.codes, b.code);
     codeSel.addEventListener('change', function () { mutate('/remote/update', {index: String(i), code: codeSel.value}); });
     row.appendChild(codeSel);
 
-    const iconSel = document.createElement('select');
-    fillIconSelect(iconSel, b.icon);
-    iconSel.addEventListener('change', function () { mutate('/remote/update', {index: String(i), icon: iconSel.value}); });
-    row.appendChild(iconSel);
-
-    const colorInput = document.createElement('input');
-    colorInput.type = 'color';
-    colorInput.value = b.color;
-    colorInput.addEventListener('change', function () { mutate('/remote/update', {index: String(i), color: colorInput.value}); });
-    row.appendChild(colorInput);
-
-    row.appendChild(makeButton('↑', 'secondary', function () { mutate('/remote/move', {index: String(i), dir: 'up'}); }));
-    row.appendChild(makeButton('↓', 'secondary', function () { mutate('/remote/move', {index: String(i), dir: 'down'}); }));
-    row.appendChild(makeButton('Delete', 'danger', function () {
-      if (confirm("Delete '" + b.name + "'?")) mutate('/remote/delete', {index: String(i)});
+    const btns = document.createElement('div');
+    btns.className = 'moveDelBtns';
+    btns.appendChild(makeButton('↑', 'secondary', function () { mutate('/remote/move', {index: String(i), dir: 'up'}); }));
+    btns.appendChild(makeButton('↓', 'secondary', function () { mutate('/remote/move', {index: String(i), dir: 'down'}); }));
+    btns.appendChild(makeButton('Delete', 'danger', function () {
+      if (confirm('Delete this button?')) mutate('/remote/delete', {index: String(i)});
     }));
+    row.appendChild(btns);
 
     list.appendChild(row);
   });
@@ -1319,7 +1359,9 @@ function renderRemote(state) {
 let iconSelectsInited = false;
 function renderSlots(state) {
   if (!iconSelectsInited) {
-    fillIconSelect(document.getElementById('remoteAddIcon'), 0);
+    const addIconSel = document.getElementById('remoteAddIcon');
+    fillIconSelect(addIconSel, 0);
+    updateAddPreview();
     iconSelectsInited = true;
   }
 
@@ -1327,27 +1369,40 @@ function renderSlots(state) {
   slotsDiv.innerHTML = '';
   state.slots.forEach(function (slot, i) {
     const row = document.createElement('div');
-    row.className = 'item' + (i === state.currentSlot ? ' selected-slot' : '');
+    row.className = 'item editRow' + (i === state.currentSlot ? ' selected-slot' : '');
     const label = document.createElement('span');
-    label.className = 'name';
+    label.className = 'label';
     label.textContent = 'Button ' + (i + 1);
     row.appendChild(label);
 
-    const select = document.createElement('select');
-    fillCodeSelect(select, state.codes, slot.code);
-    select.addEventListener('change', function () { mutate('/assignslot', {slot: String(i), name: select.value}); });
-    row.appendChild(select);
+    const preview = document.createElement('div');
+    preview.className = 'iconPreview';
+    paintIcon(preview, slot.icon, contrastColor(slot.color));
+    preview.style.background = slot.color;
+    row.appendChild(preview);
 
     const iconSel = document.createElement('select');
     fillIconSelect(iconSel, slot.icon);
-    iconSel.addEventListener('change', function () { mutate('/assignslot', {slot: String(i), icon: iconSel.value}); });
+    iconSel.addEventListener('change', function () {
+      paintIcon(preview, parseInt(iconSel.value, 10), contrastColor(colorInput.value));
+      mutate('/assignslot', {slot: String(i), icon: iconSel.value});
+    });
     row.appendChild(iconSel);
 
     const colorInput = document.createElement('input');
     colorInput.type = 'color';
     colorInput.value = slot.color;
+    colorInput.addEventListener('input', function () {
+      preview.style.background = colorInput.value;
+      paintIcon(preview, parseInt(iconSel.value, 10), contrastColor(colorInput.value));
+    });
     colorInput.addEventListener('change', function () { mutate('/assignslot', {slot: String(i), color: colorInput.value}); });
     row.appendChild(colorInput);
+
+    const select = document.createElement('select');
+    fillCodeSelect(select, state.codes, slot.code);
+    select.addEventListener('change', function () { mutate('/assignslot', {slot: String(i), name: select.value}); });
+    row.appendChild(select);
 
     slotsDiv.appendChild(row);
   });
@@ -1588,9 +1643,13 @@ void handleDeleteCode() {
       for (int i = 0; i < NUM_SLOTS; i++) {
         if (slotCodeName[i] == name) slotCodeName[i] = "";
       }
+      bool hadRemoteButton = false;
       for (auto &b : remoteButtons) {
-        if (b.codeName == name) b.codeName = "";
+        if (b.codeName == name) { b.codeName = ""; hadRemoteButton = true; }
       }
+      // MQTT discovery is keyed by codeName - a deleted code's entity would
+      // otherwise linger in HA forever since nothing else republishes it
+      if (hadRemoteButton) mqttClearDiscovery(name);
       updateScreen("Deleted code: " + name);
       markProfileDirty();
     }
@@ -1611,8 +1670,15 @@ void handleRenameCode() {
       for (int i = 0; i < NUM_SLOTS; i++) {
         if (slotCodeName[i] == oldName) slotCodeName[i] = newName;
       }
+      bool hadRemoteButton = false;
       for (auto &b : remoteButtons) {
-        if (b.codeName == oldName) b.codeName = newName;
+        if (b.codeName == oldName) { b.codeName = newName; hadRemoteButton = true; }
+      }
+      // discovery is keyed by codeName - move the HA entity from the old
+      // topic to the new one instead of leaving a stale duplicate behind
+      if (hadRemoteButton) {
+        mqttClearDiscovery(oldName);
+        mqttPublishDiscovery();
       }
       updateScreen("Renamed: " + oldName + " -> " + newName);
       markProfileDirty();
@@ -1726,37 +1792,50 @@ void handleSetColors() {
 }
 
 // ---------- virtual remote endpoints ----------
-// /remote/add?name=X&code=Y&icon=N&color=%23rrggbb - code/icon/color optional
+// /remote/add?spacer=1 adds an invisible layout-only placeholder tile - no
+// other fields needed or read. Otherwise: name/code/icon/color are all
+// optional (a button can be just a symbol + a color, or even blank, added
+// with zero typing) since requiring a typed name for every button made
+// building a remote tedious for no benefit - the tile only ever shows the
+// icon/color, name is solely for the edit list and MQTT entity naming.
 void handleRemoteAdd() {
-  if (!server.hasArg("name")) {
-    server.send(400, "text/plain", "Missing name");
+  if (server.hasArg("spacer") && server.arg("spacer") == "1") {
+    RemoteButton spacer;
+    spacer.spacer = true;
+    remoteButtons.push_back(spacer);
+    updateScreen("Remote: empty space added");
+    markProfileDirty();
+    finishRequest();
     return;
   }
-  String name = server.arg("name");
-  name.trim();
-  if (name.length() == 0) {
-    server.send(400, "text/plain", "Name can't be empty");
-    return;
-  }
+
   RemoteButton b;
-  b.name = name;
+  if (server.hasArg("name")) {
+    b.name = server.arg("name");
+    b.name.trim();
+  }
   b.codeName = server.hasArg("code") ? server.arg("code") : "";
   if (b.codeName.length() > 0 && !codeLibrary.count(b.codeName)) {
     server.send(400, "text/plain", "No such code");
     return;
   }
-  int icon = server.hasArg("icon") ? server.arg("icon").toInt() : (int)ICON_NONE;
-  b.icon = (icon >= 0 && icon < ICON_COUNT) ? icon : ICON_NONE;
-  b.color = server.hasArg("color") ? parseHexColor(server.arg("color"), DEFAULT_SLOT_COLOR) : DEFAULT_SLOT_COLOR;
+  if (server.hasArg("icon")) {
+    int icon = server.arg("icon").toInt();
+    if (icon >= 0 && icon < ICON_COUNT) b.icon = icon;
+  }
+  if (server.hasArg("color")) {
+    b.color = parseHexColor(server.arg("color"), b.color);
+  }
   remoteButtons.push_back(b);
-  updateScreen("Remote button added: " + name);
+  updateScreen("Remote button added" + (b.name.length() ? (": " + b.name) : String("")));
   markProfileDirty();
   mqttPublishDiscovery();
   finishRequest();
 }
 
 // /remote/update?index=N&name=X&code=Y&icon=N&color=%23rrggbb - all but
-// index optional, updated independently
+// index optional, updated independently. name may be set to blank (it's
+// optional - see handleRemoteAdd).
 void handleRemoteUpdate() {
   if (!server.hasArg("index")) {
     server.send(400, "text/plain", "Missing index");
@@ -1768,14 +1847,10 @@ void handleRemoteUpdate() {
     return;
   }
   RemoteButton &b = remoteButtons[idx];
-  String oldName = b.name;
+  String oldCodeName = b.codeName;
   if (server.hasArg("name")) {
     String name = server.arg("name");
     name.trim();
-    if (name.length() == 0) {
-      server.send(400, "text/plain", "Name can't be empty");
-      return;
-    }
     b.name = name;
   }
   if (server.hasArg("code")) {
@@ -1793,8 +1868,11 @@ void handleRemoteUpdate() {
   if (server.hasArg("color")) {
     b.color = parseHexColor(server.arg("color"), b.color);
   }
-  if (oldName != b.name) mqttClearDiscovery(oldName);
-  updateScreen("Remote button updated: " + b.name);
+  // discovery is keyed by codeName now (see mqttPublishDiscovery) - clear
+  // the old topic if the code changed, otherwise a retained entity for the
+  // previous code would linger in HA alongside the new one
+  if (oldCodeName != b.codeName && oldCodeName.length() > 0) mqttClearDiscovery(oldCodeName);
+  updateScreen("Remote button updated" + (b.name.length() ? (": " + b.name) : String("")));
   markProfileDirty();
   mqttPublishDiscovery();
   finishRequest();
@@ -1812,9 +1890,10 @@ void handleRemoteDelete() {
     return;
   }
   String name = remoteButtons[idx].name;
+  String codeName = remoteButtons[idx].codeName;
   remoteButtons.erase(remoteButtons.begin() + idx);
-  mqttClearDiscovery(name);
-  updateScreen("Remote button deleted: " + name);
+  if (codeName.length() > 0) mqttClearDiscovery(codeName);
+  updateScreen("Remote button deleted" + (name.length() ? (": " + name) : String("")));
   markProfileDirty();
   finishRequest();
 }
