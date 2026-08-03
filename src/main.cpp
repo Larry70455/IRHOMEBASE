@@ -41,56 +41,59 @@ std::map<uint32_t, String> triggerMap;              // hash of a learned code ->
 
 String pendingLearnName = "";  // if set, next captured signal gets saved under this name
 bool learning = false;
+String lastStatus = "Booting...";
 
-// ---------- async send queue ----------
-struct SendJob {
-  IRCode code;
-};
-
-QueueHandle_t sendQueue;
-TaskHandle_t senderTaskHandle;
+// ---------- IR sending ----------
+// Sent synchronously, on the same core/task as the receiver (setup()/loop()
+// run on core 1) and the web server. IRremote's ESP32 timer-based send/receive
+// is not safe to poke from another core concurrently - an earlier version of
+// this sent from a separate task pinned to core 0, which manipulated the
+// receiver's hardware timer (stop/restartTimer/resume) from a different core
+// than it was initialized on. That's the most likely reason blasts were
+// silently failing.
 volatile bool suppressReceive = false;
 
-void senderTask(void* param) {
-  SendJob job;
-  for (;;) {
-    if (xQueueReceive(sendQueue, &job, portMAX_DELAY) == pdTRUE) {
-      suppressReceive = true;
-      IrReceiver.stop();
+void sendCode(const IRCode &code) {
+  Serial.print("Sending raw code, len=");
+  Serial.println(code.len);
 
-      IrSender.sendRaw(job.code.data, job.code.len, 38);
+  suppressReceive = true;
+  IrReceiver.stop();
 
-      delay(40); // let the IR line settle
-      IrReceiver.restartTimer();
-      IrReceiver.resume();
-      suppressReceive = false;
-    }
-  }
+  IrSender.sendRaw(code.data, code.len, 38);
+
+  delay(40); // let the IR line settle
+  IrReceiver.restartTimer();
+  IrReceiver.resume();
+  suppressReceive = false;
+
+  Serial.println("Send complete");
 }
 
-void queueSend(const IRCode &code) {
-  SendJob job;
-  job.code = code;
-  xQueueSend(sendQueue, &job, portMAX_DELAY);
-}
-
-void queueSendByName(const String &name) {
+void sendCodeByName(const String &name) {
   auto it = codeLibrary.find(name);
   if (it != codeLibrary.end()) {
-    queueSend(it->second);
+    sendCode(it->second);
+  } else {
+    Serial.println("sendCodeByName: no code named '" + name + "'");
   }
 }
 
 void fireMacro(const String &macroName) {
   auto it = macros.find(macroName);
-  if (it == macros.end()) return;
+  if (it == macros.end()) {
+    Serial.println("fireMacro: no macro named '" + macroName + "'");
+    return;
+  }
   for (auto &codeName : it->second) {
-    queueSendByName(codeName);
+    sendCodeByName(codeName);
   }
 }
 
 // ---------- screen / LEDs ----------
 void updateScreen(String status) {
+  lastStatus = status;
+
   tft.fillRect(0, 0, 240, 160, TFT_BLACK);
   tft.setCursor(5, 5);
   tft.setTextSize(2);
@@ -154,53 +157,238 @@ String htmlEscape(const String &s) {
   return out;
 }
 
-void handleRoot() {
-  String html = "<html><body style='font-family:sans-serif'>";
-  html += "<h2>IR Controller</h2>";
-  html += "<p>" + htmlEscape(learning ? ("Learning: " + pendingLearnName) : "Idle/listening") + "</p>";
-
-  html += "<h3>Saved codes</h3><ul>";
-  for (auto &kv : codeLibrary) {
-    String name = htmlEscape(kv.first);
-    html += "<li>" + name;
-    html += " <a href='/blastcode?name=" + name + "'>[blast]</a>";
-    html += " <a href='/deletecode?name=" + name + "' onclick=\"return confirm('Delete " + name + "?')\">[delete]</a>";
-    html += " <form style='display:inline' action='/renamecode' method='get'>";
-    html += "<input type='hidden' name='oldname' value='" + name + "'>";
-    html += "<input name='newname' placeholder='new name' size='12'>";
-    html += "<input type='submit' value='rename'></form>";
-    html += "</li>";
+String jsonEscape(const String &s) {
+  String out;
+  out.reserve(s.length());
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s.charAt(i);
+    switch (c) {
+      case '"': out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      default: out += c;
+    }
   }
-  html += "</ul>";
-
-  html += "<h3>Learn new code</h3>";
-  html += "<form action='/learn' method='get'>Name: <input name='name'> <input type='submit' value='Learn'></form>";
-
-  html += "<h3>Macros</h3><ul>";
-  for (auto &kv : macros) {
-    String name = htmlEscape(kv.first);
-    html += "<li>" + name;
-    html += " <a href='/macro?name=" + name + "'>[fire]</a>";
-    html += " <a href='/deletemacro?name=" + name + "' onclick=\"return confirm('Delete " + name + "?')\">[delete]</a>";
-    html += " <form style='display:inline' action='/renamemacro' method='get'>";
-    html += "<input type='hidden' name='oldname' value='" + name + "'>";
-    html += "<input name='newname' placeholder='new name' size='12'>";
-    html += "<input type='submit' value='rename'></form>";
-    html += "</li>";
-  }
-  html += "</ul>";
-
-  html += "</body></html>";
-  server.send(200, "text/html", html);
+  return out;
 }
 
-// shown instead of learning/saving when a name would silently clobber an
+// mutating endpoints finish either with a redirect (plain form/link navigation)
+// or, for the AJAX UI, a bare 204 - the page polls /api/state for the result
+// instead of needing a fetched response body
+void finishRequest() {
+  if (server.hasArg("ajax")) {
+    server.send(204);
+  } else {
+    server.sendHeader("Location", "/");
+    server.send(303);
+  }
+}
+
+// called instead of learning/saving when a name would silently clobber an
 // existing entry - caller must resubmit with confirm=1 to proceed
 void sendOverwriteConfirm(const String &kind, const String &redirectUrl, const String &name) {
+  if (server.hasArg("ajax")) {
+    String json = "{\"conflict\":true,\"kind\":\"" + jsonEscape(kind) + "\",\"name\":\"" + jsonEscape(name) + "\"}";
+    server.send(409, "application/json", json);
+    return;
+  }
   String html = "<html><body style='font-family:sans-serif'>";
   html += "<p>A " + kind + " named '" + htmlEscape(name) + "' already exists.</p>";
   html += "<p><a href='" + redirectUrl + "&confirm=1'>Overwrite it</a> | <a href='/'>Cancel</a></p>";
   html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleApiState() {
+  String json = "{";
+  json += "\"status\":\"" + jsonEscape(lastStatus) + "\",";
+  json += "\"learning\":" + String(learning ? "true" : "false") + ",";
+  json += "\"pendingName\":\"" + jsonEscape(pendingLearnName) + "\",";
+
+  json += "\"codes\":[";
+  bool first = true;
+  for (auto &kv : codeLibrary) {
+    if (!first) json += ",";
+    first = false;
+    json += "\"" + jsonEscape(kv.first) + "\"";
+  }
+  json += "],";
+
+  json += "\"macros\":[";
+  first = true;
+  for (auto &kv : macros) {
+    if (!first) json += ",";
+    first = false;
+    json += "\"" + jsonEscape(kv.first) + "\"";
+  }
+  json += "]}";
+
+  server.send(200, "application/json", json);
+}
+
+void handleRoot() {
+  String html = R"HTML(<!doctype html>
+<html>
+<head>
+<meta charset='utf-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>IR Controller</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, system-ui, sans-serif; background:#111; color:#eee; margin:0; padding:12px 12px 40px; max-width:480px; margin-left:auto; margin-right:auto; }
+  h1 { font-size:1.3rem; margin:4px 0 12px; }
+  h2 { font-size:1rem; margin:20px 0 8px; color:#8cf; }
+  #statusBar { position:sticky; top:8px; background:#1a7a3a; color:#fff; padding:12px; border-radius:10px; margin-bottom:14px; font-weight:600; text-align:center; }
+  #statusBar.learning { background:#a06a00; }
+  .item { display:flex; align-items:center; gap:6px; background:#1c1c1c; border-radius:10px; padding:10px; margin-bottom:8px; flex-wrap:wrap; }
+  .item .name { flex:1 1 auto; min-width:70px; font-size:1rem; word-break:break-all; }
+  .empty { color:#888; font-size:0.9rem; }
+  button { font-size:0.95rem; padding:10px 14px; border-radius:8px; border:none; background:#2a7a4a; color:#fff; }
+  button.secondary { background:#3a4a6a; }
+  button.danger { background:#a03030; }
+  input[type=text] { font-size:1rem; padding:10px; border-radius:8px; border:1px solid #555; background:#222; color:#eee; width:100%; }
+  form.inline { display:flex; flex-direction:column; gap:8px; background:#1c1c1c; border-radius:10px; padding:12px; }
+</style>
+</head>
+<body>
+<h1>IR Controller</h1>
+<div id='statusBar'>Loading...</div>
+
+<h2>Saved codes</h2>
+<div id='codes'></div>
+
+<h2>Learn new code</h2>
+<form class='inline' id='learnForm'>
+  <input type='text' id='learnName' placeholder='name e.g. tv_power' autocomplete='off'>
+  <button type='submit'>Learn</button>
+</form>
+
+<h2>Macros</h2>
+<div id='macros'></div>
+
+<h2>New macro</h2>
+<form class='inline' id='macroForm'>
+  <input type='text' id='macroName' placeholder='macro name' autocomplete='off'>
+  <input type='text' id='macroCodes' placeholder='code1,code2,code3' autocomplete='off'>
+  <button type='submit'>Save macro</button>
+</form>
+
+<script>
+function api(path, params) {
+  params.ajax = '1';
+  return fetch(path + '?' + new URLSearchParams(params).toString());
+}
+
+async function mutate(path, params) {
+  const res = await api(path, params);
+  if (res.status === 409) {
+    const data = await res.json();
+    if (confirm("A " + data.kind + " named '" + data.name + "' already exists. Overwrite?")) {
+      params.confirm = '1';
+      await api(path, params);
+    }
+  }
+  refresh();
+}
+
+function makeButton(label, cls, onClick) {
+  const b = document.createElement('button');
+  b.textContent = label;
+  if (cls) b.className = cls;
+  b.addEventListener('click', onClick);
+  return b;
+}
+
+function blastCode(name) { mutate('/blastcode', {name: name}); }
+function deleteCode(name) { if (confirm("Delete '" + name + "'?")) mutate('/deletecode', {name: name}); }
+function renameCode(oldname) {
+  const n = prompt("New name for '" + oldname + "':", oldname);
+  if (n) mutate('/renamecode', {oldname: oldname, newname: n});
+}
+function fireMacro(name) { mutate('/macro', {name: name}); }
+function deleteMacro(name) { if (confirm("Delete '" + name + "'?")) mutate('/deletemacro', {name: name}); }
+function renameMacro(oldname) {
+  const n = prompt("New name for '" + oldname + "':", oldname);
+  if (n) mutate('/renamemacro', {oldname: oldname, newname: n});
+}
+
+document.getElementById('learnForm').addEventListener('submit', function (e) {
+  e.preventDefault();
+  const input = document.getElementById('learnName');
+  const name = input.value.trim();
+  if (name) mutate('/learn', {name: name});
+  input.value = '';
+});
+
+document.getElementById('macroForm').addEventListener('submit', function (e) {
+  e.preventDefault();
+  const nameInput = document.getElementById('macroName');
+  const codesInput = document.getElementById('macroCodes');
+  const name = nameInput.value.trim();
+  const codes = codesInput.value.trim();
+  if (name && codes) mutate('/definemacro', {name: name, codes: codes});
+  nameInput.value = '';
+  codesInput.value = '';
+});
+
+function render(state) {
+  const bar = document.getElementById('statusBar');
+  bar.textContent = state.status + (state.learning ? ' (' + state.pendingName + ')' : '');
+  bar.className = state.learning ? 'learning' : '';
+
+  const codesDiv = document.getElementById('codes');
+  codesDiv.innerHTML = '';
+  if (state.codes.length === 0) {
+    codesDiv.innerHTML = "<p class='empty'>No codes learned yet.</p>";
+  }
+  state.codes.forEach(function (name) {
+    const row = document.createElement('div');
+    row.className = 'item';
+    const span = document.createElement('span');
+    span.className = 'name';
+    span.textContent = name;
+    row.appendChild(span);
+    row.appendChild(makeButton('Blast', '', function () { blastCode(name); }));
+    row.appendChild(makeButton('Rename', 'secondary', function () { renameCode(name); }));
+    row.appendChild(makeButton('Delete', 'danger', function () { deleteCode(name); }));
+    codesDiv.appendChild(row);
+  });
+
+  const macrosDiv = document.getElementById('macros');
+  macrosDiv.innerHTML = '';
+  if (state.macros.length === 0) {
+    macrosDiv.innerHTML = "<p class='empty'>No macros yet.</p>";
+  }
+  state.macros.forEach(function (name) {
+    const row = document.createElement('div');
+    row.className = 'item';
+    const span = document.createElement('span');
+    span.className = 'name';
+    span.textContent = name;
+    row.appendChild(span);
+    row.appendChild(makeButton('Fire', '', function () { fireMacro(name); }));
+    row.appendChild(makeButton('Rename', 'secondary', function () { renameMacro(name); }));
+    row.appendChild(makeButton('Delete', 'danger', function () { deleteMacro(name); }));
+    macrosDiv.appendChild(row);
+  });
+}
+
+async function refresh() {
+  try {
+    const res = await fetch('/api/state');
+    const state = await res.json();
+    render(state);
+  } catch (e) { /* transient - next poll will retry */ }
+}
+
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>
+)HTML";
   server.send(200, "text/html", html);
 }
 
@@ -217,18 +405,16 @@ void handleLearn() {
     updateScreen("Point remote & press...");
     flashLeds(CRGB::Yellow, 150);
   }
-  server.sendHeader("Location", "/");
-  server.send(303);
+  finishRequest();
 }
 
 void handleBlastCode() {
   if (server.hasArg("name")) {
-    queueSendByName(server.arg("name"));
+    sendCodeByName(server.arg("name"));
     updateScreen("Blasted: " + server.arg("name"));
     flashLeds(CRGB::Blue, 120);
   }
-  server.sendHeader("Location", "/");
-  server.send(303);
+  finishRequest();
 }
 
 void handleMacro() {
@@ -237,8 +423,7 @@ void handleMacro() {
     updateScreen("Macro fired: " + server.arg("name"));
     flashLeds(CRGB::Blue, 120);
   }
-  server.sendHeader("Location", "/");
-  server.send(303);
+  finishRequest();
 }
 
 // simple endpoint to define a macro from the app, e.g.
@@ -263,8 +448,7 @@ void handleDefineMacro() {
     macros[name] = list;
     updateScreen("Macro saved: " + name);
   }
-  server.sendHeader("Location", "/");
-  server.send(303);
+  finishRequest();
 }
 
 // link a learned code as a trigger for a macro, e.g.
@@ -279,8 +463,7 @@ void handleLinkTrigger() {
       updateScreen("Trigger linked: " + codeName);
     }
   }
-  server.sendHeader("Location", "/");
-  server.send(303);
+  finishRequest();
 }
 
 // /deletecode?name=tv_power
@@ -299,8 +482,7 @@ void handleDeleteCode() {
       updateScreen("Deleted code: " + name);
     }
   }
-  server.sendHeader("Location", "/");
-  server.send(303);
+  finishRequest();
 }
 
 // /renamecode?oldname=tv_power&newname=tv_on
@@ -320,8 +502,7 @@ void handleRenameCode() {
       updateScreen("Renamed: " + oldName + " -> " + newName);
     }
   }
-  server.sendHeader("Location", "/");
-  server.send(303);
+  finishRequest();
 }
 
 // /deletemacro?name=power_all
@@ -336,8 +517,7 @@ void handleDeleteMacro() {
       updateScreen("Deleted macro: " + name);
     }
   }
-  server.sendHeader("Location", "/");
-  server.send(303);
+  finishRequest();
 }
 
 // /renamemacro?oldname=power_all&newname=movie_time
@@ -355,8 +535,7 @@ void handleRenameMacro() {
       updateScreen("Renamed macro: " + oldName + " -> " + newName);
     }
   }
-  server.sendHeader("Location", "/");
-  server.send(303);
+  finishRequest();
 }
 
 unsigned long lastLearnBtn = 0;
@@ -397,6 +576,7 @@ void setup() {
   }
 
   server.on("/", handleRoot);
+  server.on("/api/state", handleApiState);
   server.on("/learn", handleLearn);
   server.on("/blastcode", handleBlastCode);
   server.on("/macro", handleMacro);
@@ -407,10 +587,6 @@ void setup() {
   server.on("/deletemacro", handleDeleteMacro);
   server.on("/renamemacro", handleRenameMacro);
   server.begin();
-
-  // async sender task, pinned to core 0, so core 1's loop() (receiver + web server) never blocks
-  sendQueue = xQueueCreate(10, sizeof(SendJob));
-  xTaskCreatePinnedToCore(senderTask, "IRSender", 4096, NULL, 1, &senderTaskHandle, 0);
 
   updateScreen("Ready");
 }
