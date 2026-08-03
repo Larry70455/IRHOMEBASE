@@ -362,6 +362,7 @@ static const char PAGE_HTML[] PROGMEM = R"HTML(<!doctype html>
   button { font-size:0.95rem; padding:10px 14px; border-radius:8px; border:none; background:#2a7a4a; color:#fff; }
   button.secondary { background:#3a4a6a; }
   button.danger { background:#a03030; }
+  body.busy button { opacity:0.5; pointer-events:none; }
   input[type=text] { font-size:1rem; padding:10px; border-radius:8px; border:1px solid #555; background:#222; color:#eee; width:100%; }
   form.inline { display:flex; flex-direction:column; gap:8px; background:#1c1c1c; border-radius:10px; padding:12px; }
 </style>
@@ -397,19 +398,37 @@ static const char PAGE_HTML[] PROGMEM = R"HTML(<!doctype html>
 </div>
 
 <script>
+// The device serves one HTTP request at a time and some actions (a blast,
+// a multi-code macro) can take a while. Without this guard, a tap while a
+// previous request is still pending - or the 1s poll landing mid-action -
+// doesn't get dropped, it queues up on the device and fires later, which
+// shows up as "nothing happened, so I pressed again" followed by a double
+// fire once the backlog clears. Only ever have one request in flight.
+let busy = false;
+function setBusy(value) {
+  busy = value;
+  document.body.classList.toggle('busy', value);
+}
+
 function api(path, params) {
   params.ajax = '1';
   return fetch(path + '?' + new URLSearchParams(params).toString());
 }
 
 async function mutate(path, params) {
-  const res = await api(path, params);
-  if (res.status === 409) {
-    const data = await res.json();
-    if (confirm("A " + data.kind + " named '" + data.name + "' already exists. Overwrite?")) {
-      params.confirm = '1';
-      await api(path, params);
+  if (busy) return;
+  setBusy(true);
+  try {
+    const res = await api(path, params);
+    if (res.status === 409) {
+      const data = await res.json();
+      if (confirm("A " + data.kind + " named '" + data.name + "' already exists. Overwrite?")) {
+        params.confirm = '1';
+        await api(path, params);
+      }
     }
+  } finally {
+    setBusy(false);
   }
   refresh();
 }
@@ -512,11 +531,17 @@ function render(state) {
 }
 
 async function refresh() {
+  if (busy) return; // a mutation (or a previous poll) is still in flight - don't stack another request
+  setBusy(true);
   try {
     const res = await fetch('/api/state');
     const state = await res.json();
     render(state);
-  } catch (e) { /* transient - next poll will retry */ }
+  } catch (e) {
+    // transient - next poll will retry
+  } finally {
+    setBusy(false);
+  }
 }
 
 refresh();
