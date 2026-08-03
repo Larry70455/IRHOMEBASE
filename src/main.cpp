@@ -207,15 +207,64 @@ volatile bool suppressReceive = false;
 // Protocol-encoded codes come from the IRDB lookup feature (see below): it
 // gives protocol/address/command rather than a raw timing capture, so
 // sending means re-encoding via IRremote's named protocol senders rather
-// than replaying a buffer. Only the NEC family is attempted with any real
-// confidence right now - IRDB covers many other protocols (RC5, RC6, Sony,
-// Kaseikyo/Panasonic, ...) whose exact address/command encoding I can't
-// verify without hardware to test against, so those are reported as
-// unsupported rather than guessed at and possibly sent wrong.
-bool isProtocolSupported(const String &protocol) {
-  String p = protocol;
+// than replaying a buffer. This is an explicit allow-list, not a "looks
+// like it might work" guess - every entry here was checked against
+// IRremote's actual public sendXxx() signatures (Arduino-IRremote source)
+// and against real sample rows fetched from IRDB during development, so
+// the device/subdevice/function -> address/command mapping is grounded in
+// something concrete. Still, none of it has been fired at real hardware -
+// NEC is the one family independently verified this session (its
+// "extended vs classic 8-bit" split falls out naturally from whether the
+// combined address exceeds 0xFF, which is also how IrSender.sendNEC()
+// itself decides, so there's no guessing there). The rest carries real but
+// lower confidence. Deliberately left out: bare "Kaseikyo" (the vendor ID
+// baked into the frame differs per manufacturer and IRDB doesn't expose
+// which one to use), Samsung's 36/48-bit and "SamsungLG" variants, Sony
+// bit-widths other than 12/15/20, and anything not in this list at all
+// (Fujitsu, Sharp, Denon, Mitsubishi, Onkyo, ...) - those are reported as
+// unsupported rather than sent on a guess.
+bool isProtocolSupported(const String &protocolIn) {
+  String p = protocolIn;
   p.toUpperCase();
-  return p.indexOf("NEC") >= 0;
+  if (p.indexOf("NEC") >= 0) return true;
+  if (p == "SONY" || p == "SONY12" || p == "SONY15" || p == "SONY20") return true;
+  if (p == "RC5" || p == "RC-5") return true;
+  if (p == "RC6" || p == "RC-6") return true;
+  if (p == "JVC") return true;
+  if (p == "PANASONIC") return true;
+  if (p == "SAMSUNG") return true;
+  if (p == "LG") return true;
+  return false;
+}
+
+// Only called once isProtocolSupported() has already said yes - dispatches
+// to the matching IRremote sender. Every non-NEC protocol here uses
+// `device` directly as a single address value (confirmed against real IRDB
+// samples: e.g. Sony15 rows list device=100 as the SIRC address, not
+// something needing NEC's device+subdevice packing).
+void sendProtocolEncoded(const IRCode &code) {
+  String p = code.protocol;
+  p.toUpperCase();
+  if (p.indexOf("NEC") >= 0) {
+    IrSender.sendNEC(code.address, (uint8_t)code.command, 0);
+  } else if (p.startsWith("SONY")) {
+    uint8_t bits = 12;
+    if (p == "SONY20") bits = 20;
+    else if (p == "SONY15") bits = 15;
+    IrSender.sendSony(code.address, (uint8_t)code.command, 0, bits);
+  } else if (p == "RC5" || p == "RC-5") {
+    IrSender.sendRC5((uint8_t)code.address, (uint8_t)code.command, 0, true);
+  } else if (p == "RC6" || p == "RC-6") {
+    IrSender.sendRC6((uint8_t)code.address, (uint8_t)code.command, 0, true);
+  } else if (p == "JVC") {
+    IrSender.sendJVC((uint8_t)code.address, (uint8_t)code.command, 0);
+  } else if (p == "PANASONIC") {
+    IrSender.sendPanasonic(code.address, (uint8_t)code.command, 0);
+  } else if (p == "SAMSUNG") {
+    IrSender.sendSamsung(code.address, code.command, 0);
+  } else if (p == "LG") {
+    IrSender.sendLG((uint8_t)code.address, code.command, 0);
+  }
 }
 
 void sendCode(const IRCode &code) {
@@ -237,7 +286,7 @@ void sendCode(const IRCode &code) {
   if (isProtocolEncoded) {
     Serial.printf("Sending %s code, address=%u command=%u\n",
                   code.protocol.c_str(), code.address, code.command);
-    IrSender.sendNEC(code.address, code.command, 0);
+    sendProtocolEncoded(code);
   } else {
     Serial.print("Sending raw code, len=");
     Serial.println(code.len);
@@ -968,6 +1017,10 @@ static const char PAGE_HTML[] PROGMEM = R"HTML(<!doctype html>
   .editRow { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
   .editRow .label { flex:1 1 90px; min-width:70px; }
   .editRow .moveDelBtns { display:flex; gap:6px; margin-left:auto; }
+  .dragHandle { touch-action:none; cursor:grab; color:#888; flex:0 0 auto; padding:4px; display:flex; align-items:center; }
+  .dragHandle:active { cursor:grabbing; color:#eee; }
+  #remoteList .item.dragging { opacity:0.4; }
+  #remoteList .item.dragOver { outline:2px dashed #4cf4f4; }
 </style>
 </head>
 <body>
@@ -1021,7 +1074,7 @@ static const char PAGE_HTML[] PROGMEM = R"HTML(<!doctype html>
 
 <div class='tabPanel' id='tab-lookup'>
   <h2>Look up a remote</h2>
-  <p class='empty'>Searches a public IR code database (probonopd/irdb) right from your phone - the device itself only handles the final "try/save" step. Sending only works reliably for NEC-family codes right now; other protocols will say so instead of guessing.</p>
+  <p class='empty'>Searches a public IR code database (probonopd/irdb) right from your phone - the device itself only handles the final "try/save" step. Sends NEC, Sony, RC5, RC6, JVC, Panasonic, Samsung, and LG family codes; anything else says so instead of guessing.</p>
   <div class='item'>
     <input type='text' id='lookupManufacturer' placeholder='Manufacturer, e.g. Samsung'>
   </div>
@@ -1031,6 +1084,16 @@ static const char PAGE_HTML[] PROGMEM = R"HTML(<!doctype html>
   </div>
   <div id='lookupResults'></div>
   <div id='lookupFunctions'></div>
+
+  <h3>Don't know the manufacturer?</h3>
+  <p class='empty'>Blind search: tries devices in the database one at a time so you can watch for a reaction, the same way a universal remote's code-search mode works. Leave device type blank to search everything.</p>
+  <div class='item'>
+    <input type='text' id='blindDeviceType' placeholder='Device type (optional)'>
+    <button type='button' onclick='blindStart()'>Start blind search</button>
+    <button type='button' class='secondary' onclick='blindStop()'>Stop</button>
+  </div>
+  <div id='blindStatus'></div>
+  <div id='blindCandidate' class='item'></div>
 </div>
 
 <div class='tabPanel' id='tab-codes'>
@@ -1261,6 +1324,59 @@ document.getElementById('remoteAddIcon').addEventListener('change', updateAddPre
 document.getElementById('remoteAddColor').addEventListener('change', updateAddPreview);
 document.getElementById('remoteAddColor').addEventListener('input', updateAddPreview);
 
+// Drag-to-reorder for the Remote edit list, built on Pointer Events rather
+// than native HTML5 drag-and-drop - the native API essentially doesn't work
+// on mobile touch browsers (which is where this app is actually used)
+// without extra polyfilling, while Pointer Events (with touch-action:none
+// on just the handle, not the whole row) unify mouse/touch/pen and behave
+// consistently. Rows still get up/down buttons too as a fallback in case a
+// drag gesture doesn't register on some browser.
+let dragFromIndex = null;
+let dragHoverIndex = null;
+function clearDragHighlights() {
+  document.querySelectorAll('#remoteList .dragOver').forEach(function (el) { el.classList.remove('dragOver'); });
+}
+function makeDragHandle(row, index) {
+  const handle = document.createElement('div');
+  handle.className = 'dragHandle';
+  handle.innerHTML = '<svg viewBox="0 0 24 24" width="20" height="20"><circle cx="8" cy="6" r="1.6" fill="currentColor"/><circle cx="16" cy="6" r="1.6" fill="currentColor"/><circle cx="8" cy="12" r="1.6" fill="currentColor"/><circle cx="16" cy="12" r="1.6" fill="currentColor"/><circle cx="8" cy="18" r="1.6" fill="currentColor"/><circle cx="16" cy="18" r="1.6" fill="currentColor"/></svg>';
+  handle.addEventListener('pointerdown', function (e) {
+    dragFromIndex = index;
+    dragHoverIndex = index;
+    row.classList.add('dragging');
+    handle.setPointerCapture(e.pointerId);
+    e.preventDefault();
+  });
+  handle.addEventListener('pointermove', function (e) {
+    if (dragFromIndex === null) return;
+    const list = document.getElementById('remoteList');
+    let target = null;
+    for (const child of list.children) {
+      const rect = child.getBoundingClientRect();
+      if (e.clientY >= rect.top && e.clientY <= rect.bottom) { target = child; break; }
+    }
+    clearDragHighlights();
+    if (target) {
+      dragHoverIndex = parseInt(target.dataset.index, 10);
+      target.classList.add('dragOver');
+    }
+  });
+  function endDrag(e) {
+    if (dragFromIndex === null) return;
+    if (handle.hasPointerCapture(e.pointerId)) handle.releasePointerCapture(e.pointerId);
+    row.classList.remove('dragging');
+    clearDragHighlights();
+    if (dragHoverIndex !== null && dragHoverIndex !== dragFromIndex) {
+      mutate('/remote/reorder', {from: String(dragFromIndex), to: String(dragHoverIndex)});
+    }
+    dragFromIndex = null;
+    dragHoverIndex = null;
+  }
+  handle.addEventListener('pointerup', endDrag);
+  handle.addEventListener('pointercancel', endDrag);
+  return handle;
+}
+
 function renderRemote(state) {
   const colSel = document.getElementById('remoteColumnsSel');
   if (document.activeElement !== colSel) colSel.value = String(state.remoteColumns);
@@ -1295,6 +1411,8 @@ function renderRemote(state) {
   state.remote.forEach(function (b, i) {
     const row = document.createElement('div');
     row.className = 'item editRow';
+    row.dataset.index = String(i);
+    row.appendChild(makeDragHandle(row, i));
 
     if (b.spacer) {
       const label = document.createElement('span');
@@ -1463,41 +1581,54 @@ async function lookupSearch() {
   }
 }
 
+// Fetches one device's CSV and parses it into {funcName,protocol,device,
+// subdevice,func} rows - shared by the manufacturer-driven lookup below and
+// the blind search further down, so both read a device file the same way.
+async function fetchDeviceRows(path) {
+  const res = await fetch(irdbPathToUrl(path));
+  const text = await res.text();
+  const lines = text.split('\n').map(function (l) { return l.trim(); }).filter(function (l) { return l.length > 0; });
+  lines.shift(); // header row
+  return lines.map(function (line) {
+    const parts = line.split(',');
+    if (parts.length < 5) return null;
+    return {funcName: parts[0], protocol: parts[1], device: parts[2], subdevice: parts[3], func: parts[4]};
+  }).filter(function (r) { return r !== null; });
+}
+
+function renderDeviceFunctions(rows) {
+  const funcsDiv = document.getElementById('lookupFunctions');
+  funcsDiv.innerHTML = '';
+  if (rows.length === 0) {
+    funcsDiv.innerHTML = "<p class='empty'>No functions found in this file.</p>";
+    return;
+  }
+  rows.forEach(function (r) {
+    const row = document.createElement('div');
+    row.className = 'item';
+    const label = document.createElement('span');
+    label.className = 'name';
+    label.textContent = r.funcName + ' (' + r.protocol + ')';
+    row.appendChild(label);
+    row.appendChild(makeButton('Try', '', function () { lookupTry(r.protocol, r.device, r.subdevice, r.func); }));
+    const nameInput = document.createElement('input');
+    nameInput.type = 'text';
+    nameInput.placeholder = 'save as...';
+    nameInput.value = r.funcName.toLowerCase().replace(/[^a-z0-9]+/g, '_');
+    nameInput.style.maxWidth = '110px';
+    row.appendChild(nameInput);
+    row.appendChild(makeButton('Save', 'secondary', function () {
+      if (nameInput.value.trim()) lookupSave(nameInput.value.trim(), r.protocol, r.device, r.subdevice, r.func);
+    }));
+    funcsDiv.appendChild(row);
+  });
+}
+
 async function lookupLoadDevice(path) {
   const funcsDiv = document.getElementById('lookupFunctions');
   funcsDiv.innerHTML = "<p class='empty'>Loading...</p>";
   try {
-    const res = await fetch(irdbPathToUrl(path));
-    const text = await res.text();
-    const lines = text.split('\n').map(function (l) { return l.trim(); }).filter(function (l) { return l.length > 0; });
-    lines.shift(); // header row
-    funcsDiv.innerHTML = '';
-    if (lines.length === 0) {
-      funcsDiv.innerHTML = "<p class='empty'>No functions found in this file.</p>";
-      return;
-    }
-    lines.forEach(function (line) {
-      const parts = line.split(',');
-      if (parts.length < 5) return;
-      const funcName = parts[0], protocol = parts[1], device = parts[2], subdevice = parts[3], func = parts[4];
-      const row = document.createElement('div');
-      row.className = 'item';
-      const label = document.createElement('span');
-      label.className = 'name';
-      label.textContent = funcName + ' (' + protocol + ')';
-      row.appendChild(label);
-      row.appendChild(makeButton('Try', '', function () { lookupTry(protocol, device, subdevice, func); }));
-      const nameInput = document.createElement('input');
-      nameInput.type = 'text';
-      nameInput.placeholder = 'save as...';
-      nameInput.value = funcName.toLowerCase().replace(/[^a-z0-9]+/g, '_');
-      nameInput.style.maxWidth = '110px';
-      row.appendChild(nameInput);
-      row.appendChild(makeButton('Save', 'secondary', function () {
-        if (nameInput.value.trim()) lookupSave(nameInput.value.trim(), protocol, device, subdevice, func);
-      }));
-      funcsDiv.appendChild(row);
-    });
+    renderDeviceFunctions(await fetchDeviceRows(path));
   } catch (e) {
     funcsDiv.innerHTML = "<p class='empty'>Failed to load that file.</p>";
   }
@@ -1532,6 +1663,92 @@ async function lookupSave(name, protocol, device, subdevice, func) {
     setActionBusy(false);
   }
   refresh();
+}
+
+// ---- Blind search: for a device with no manufacturer name to go on (worn
+// label, no remote at all, genuinely obscure) - walks IRDB device entries
+// one at a time, guesses which row is most likely the power button, and
+// lets you Try it until one actually reacts. Same idea as the "code search"
+// mode on a universal remote. Device type is optional here too - blank
+// searches every device in the index, not just one category.
+let blindCandidates = [];
+let blindIndex = -1;
+
+function blindPickRow(rows) {
+  const guess = rows.find(function (r) { return /power|standby|on\/?off/i.test(r.funcName); });
+  return guess || rows[0];
+}
+
+async function blindStart() {
+  const type = document.getElementById('blindDeviceType').value.trim().toLowerCase();
+  const statusDiv = document.getElementById('blindStatus');
+  document.getElementById('blindCandidate').innerHTML = '';
+  statusDiv.innerHTML = "<p class='empty'>Loading index...</p>";
+  try {
+    const index = await loadIrdbIndex();
+    blindCandidates = index.filter(function (line) {
+      if (!type) return true;
+      const parts = line.split('/');
+      return parts.length >= 2 && parts[1].toLowerCase().indexOf(type) >= 0;
+    });
+    if (blindCandidates.length === 0) {
+      statusDiv.innerHTML = "<p class='empty'>No devices match that type. Try leaving it blank to search everything.</p>";
+      return;
+    }
+    blindIndex = -1;
+    blindNext();
+  } catch (e) {
+    statusDiv.innerHTML = "<p class='empty'>Couldn't load the code index - check your internet connection.</p>";
+  }
+}
+
+// Always requires an explicit tap to move to the next candidate (Next or
+// Skip) rather than auto-advancing on empty/failed entries - auto-recursing
+// through failures would turn one offline moment into a tight loop hammering
+// every remaining candidate at once.
+async function blindNext() {
+  blindIndex++;
+  const statusDiv = document.getElementById('blindStatus');
+  const candDiv = document.getElementById('blindCandidate');
+  if (blindIndex >= blindCandidates.length) {
+    statusDiv.innerHTML = "<p class='empty'>That's every candidate - none confirmed. Try a different or blank device type.</p>";
+    candDiv.innerHTML = '';
+    return;
+  }
+  const path = blindCandidates[blindIndex];
+  statusDiv.textContent = 'Candidate ' + (blindIndex + 1) + ' of ' + blindCandidates.length + ': ' + path.replace(/\.csv$/, '');
+  candDiv.innerHTML = "<p class='empty'>Loading...</p>";
+  let rows;
+  try {
+    rows = await fetchDeviceRows(path);
+  } catch (e) {
+    candDiv.innerHTML = "<p class='empty'>Failed to load this one.</p>";
+    candDiv.appendChild(makeButton('Skip', 'secondary', blindNext));
+    return;
+  }
+  if (rows.length === 0) {
+    candDiv.innerHTML = "<p class='empty'>No functions in this one.</p>";
+    candDiv.appendChild(makeButton('Skip', 'secondary', blindNext));
+    return;
+  }
+  const row = blindPickRow(rows);
+  candDiv.innerHTML = '';
+  candDiv.appendChild(makeButton('Try: ' + row.funcName, '', function () {
+    lookupTry(row.protocol, row.device, row.subdevice, row.func);
+  }));
+  candDiv.appendChild(makeButton('Next', 'secondary', blindNext));
+  candDiv.appendChild(makeButton("It worked! Show all buttons", 'secondary', function () {
+    statusDiv.innerHTML = '';
+    candDiv.innerHTML = '';
+    lookupLoadDevice(path);
+  }));
+}
+
+function blindStop() {
+  blindCandidates = [];
+  blindIndex = -1;
+  document.getElementById('blindStatus').innerHTML = '';
+  document.getElementById('blindCandidate').innerHTML = '';
 }
 
 function render(state) {
@@ -1898,11 +2115,10 @@ void handleRemoteDelete() {
   finishRequest();
 }
 
-// /remote/move?index=N&dir=up|down - swaps with its neighbor. Up/down
-// buttons rather than drag-and-drop: native HTML5 drag-and-drop is
-// unreliable on mobile touch browsers, which is where this app is actually
-// used, so a fiddly "works on desktop, flaky on your phone" reorder isn't
-// worth it for what's ultimately the same outcome.
+// /remote/move?index=N&dir=up|down - swaps with its neighbor. Kept
+// alongside /remote/reorder (below) as a reliable one-tap fallback for the
+// drag handle - useful for precise single-step nudges, or if a drag gesture
+// doesn't register on a given browser/input method.
 void handleRemoteMove() {
   if (!server.hasArg("index") || !server.hasArg("dir")) {
     server.send(400, "text/plain", "Missing index or dir");
@@ -1921,6 +2137,32 @@ void handleRemoteMove() {
   }
   std::swap(remoteButtons[idx], remoteButtons[swapWith]);
   markProfileDirty();
+  finishRequest();
+}
+
+// /remote/reorder?from=N&to=M - moves the button at `from` to sit at
+// position `to`, shifting everything between (not a swap - a swap would
+// leave the dragged button's old neighbor displaced in the wrong direction,
+// which doesn't match what dragging a tile to a new spot visually means).
+// Backs the drag-and-drop reorder in the web UI; /remote/move above still
+// covers precise single-step nudges.
+void handleRemoteReorder() {
+  if (!server.hasArg("from") || !server.hasArg("to")) {
+    server.send(400, "text/plain", "Missing from or to");
+    return;
+  }
+  int from = server.arg("from").toInt();
+  int to = server.arg("to").toInt();
+  if (from < 0 || from >= (int)remoteButtons.size() || to < 0 || to >= (int)remoteButtons.size()) {
+    server.send(400, "text/plain", "Index out of range");
+    return;
+  }
+  if (from != to) {
+    RemoteButton moved = remoteButtons[from];
+    remoteButtons.erase(remoteButtons.begin() + from);
+    remoteButtons.insert(remoteButtons.begin() + to, moved);
+    markProfileDirty();
+  }
   finishRequest();
 }
 
@@ -1954,20 +2196,31 @@ IRCode lookupCodeFromArgs(bool &ok) {
     return code;
   }
   code.protocol = server.arg("protocol");
-  int device = server.hasArg("device") ? server.arg("device").toInt() : 0;
-  int subdevice = server.hasArg("subdevice") ? server.arg("subdevice").toInt() : -1;
-  int function = server.arg("function").toInt();
-  // IRDB gives device+subdevice as separate bytes; for NEC-family protocols
-  // that's the standard extended-NEC address layout (low byte, high byte).
-  // subdevice -1 means "old" 8-bit NEC with no separate high byte.
-  code.address = (subdevice >= 0) ? (uint16_t)((device & 0xFF) | ((subdevice & 0xFF) << 8))
-                                   : (uint16_t)(device & 0xFF);
-  code.command = (uint16_t)(function & 0xFFFF);
-
   if (!isProtocolSupported(code.protocol)) {
     server.send(400, "text/plain", "Protocol '" + code.protocol + "' isn't supported for sending yet - try a different profile/protocol");
     return code;
   }
+  int device = server.hasArg("device") ? server.arg("device").toInt() : 0;
+  int subdevice = server.hasArg("subdevice") ? server.arg("subdevice").toInt() : -1;
+  int function = server.arg("function").toInt();
+
+  String p = code.protocol;
+  p.toUpperCase();
+  if (p.indexOf("NEC") >= 0) {
+    // IRDB gives device+subdevice as separate bytes; for NEC-family that's
+    // the standard extended-NEC address layout (low byte, high byte).
+    // subdevice -1 means "old" 8-bit NEC with no separate high byte - and
+    // that split is also how IrSender.sendNEC() itself decides which form
+    // to send, so this isn't a guess either way.
+    code.address = (subdevice >= 0) ? (uint16_t)((device & 0xFF) | ((subdevice & 0xFF) << 8))
+                                     : (uint16_t)(device & 0xFF);
+  } else {
+    // every other supported protocol takes a single address value, not a
+    // packed device+subdevice pair (confirmed against real IRDB samples)
+    code.address = (uint16_t)(device & 0xFFFF);
+  }
+  code.command = (uint16_t)(function & 0xFFFF);
+
   ok = true;
   return code;
 }
@@ -2283,6 +2536,7 @@ void setup() {
   server.on("/remote/update", handleRemoteUpdate);
   server.on("/remote/delete", handleRemoteDelete);
   server.on("/remote/move", handleRemoteMove);
+  server.on("/remote/reorder", handleRemoteReorder);
   server.on("/remote/columns", handleRemoteColumns);
   server.on("/trylookup", handleTryLookup);
   server.on("/savelookupcode", handleSaveLookupCode);
