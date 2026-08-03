@@ -201,7 +201,13 @@ void sendOverwriteConfirm(const String &kind, const String &redirectUrl, const S
 }
 
 void handleApiState() {
-  String json = "{";
+  // this is rebuilt on every poll (default: once a second) - reserving up
+  // front avoids the repeated grow/copy/free cycle that += would otherwise
+  // do on nearly every line below, which is a steady source of heap
+  // fragmentation on a device that stays powered on for a long time
+  String json;
+  json.reserve(160 + 24 * (codeLibrary.size() + macros.size()));
+  json += "{";
   json += "\"status\":\"" + jsonEscape(lastStatus) + "\",";
   json += "\"learning\":" + String(learning ? "true" : "false") + ",";
   json += "\"pendingName\":\"" + jsonEscape(pendingLearnName) + "\",";
@@ -227,8 +233,12 @@ void handleApiState() {
   server.send(200, "application/json", json);
 }
 
-void handleRoot() {
-  String html = R"HTML(<!doctype html>
+// Static page: everything dynamic is fetched via /api/state, so this never
+// changes at runtime. Kept in flash (PROGMEM) and streamed directly by
+// handleRoot() instead of being copied into a heap String on every request -
+// with polling hitting this device constantly, that copy was a steady source
+// of heap churn/fragmentation that got worse the longer the device stayed up.
+static const char PAGE_HTML[] PROGMEM = R"HTML(<!doctype html>
 <html>
 <head>
 <meta charset='utf-8'>
@@ -389,7 +399,9 @@ setInterval(refresh, 1000);
 </body>
 </html>
 )HTML";
-  server.send(200, "text/html", html);
+
+void handleRoot() {
+  server.send_P(200, "text/html", PAGE_HTML);
 }
 
 void handleLearn() {
@@ -635,5 +647,16 @@ void loop() {
     static uint8_t hue = 0;
     fill_rainbow(leds, NUM_LEDS, hue++, 7);
     FastLED.show();
+  }
+
+  // watch for heap fragmentation/leaks over long uptimes: getFreeHeap()
+  // dropping over time points at a leak; getMinFreeHeap() staying near
+  // getFreeHeap() while getMaxAllocHeap() falls well below it points at
+  // fragmentation (memory is free, just not contiguous)
+  static unsigned long lastHeapLog = 0;
+  if (millis() - lastHeapLog > 10000) {
+    lastHeapLog = millis();
+    Serial.printf("[heap] free=%u minFree=%u maxAlloc=%u uptime=%lus\n",
+                  ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getMaxAllocHeap(), millis() / 1000);
   }
 }
