@@ -83,14 +83,27 @@ void sendCodeByName(const String &name) {
   }
 }
 
-void fireMacro(const String &macroName) {
+// A single code send still blocks briefly (the raw transmission time plus a
+// settle delay) - that part's unavoidable without going back to a separate
+// task, which is what broke sending in the first place (see above). What we
+// CAN avoid is blocking for an entire macro's worth of codes in one unbroken
+// call: queued sends are drained one at a time from loop(), so the web
+// server, IR receiver, and LEDs all still get serviced between each code in
+// a multi-code macro instead of only after the whole thing finishes.
+std::vector<String> pendingSends;
+
+void queueCodeSend(const String &name) {
+  pendingSends.push_back(name);
+}
+
+void queueMacro(const String &macroName) {
   auto it = macros.find(macroName);
   if (it == macros.end()) {
-    Serial.println("fireMacro: no macro named '" + macroName + "'");
+    Serial.println("queueMacro: no macro named '" + macroName + "'");
     return;
   }
   for (auto &codeName : it->second) {
-    sendCodeByName(codeName);
+    queueCodeSend(codeName);
   }
 }
 
@@ -121,10 +134,18 @@ void updateScreen(String status) {
   tft.println(".local");
 }
 
+// Sets the LEDs immediately and returns without blocking; loop() reverts
+// them (to the idle rainbow, or just off while learning) once the requested
+// duration has elapsed. Previously this used delay(), which blocked the web
+// server/receiver for the flash's full duration on nearly every action.
+bool ledFlashActive = false;
+unsigned long ledFlashUntil = 0;
+
 void flashLeds(CRGB color, int ms) {
   fill_solid(leds, NUM_LEDS, color);
   FastLED.show();
-  delay(ms);
+  ledFlashActive = true;
+  ledFlashUntil = millis() + ms;
 }
 
 // ---------- capture helper ----------
@@ -573,18 +594,16 @@ void handleLearn() {
 
 void handleBlastCode() {
   if (server.hasArg("name")) {
-    sendCodeByName(server.arg("name"));
-    updateScreen("Blasted: " + server.arg("name"));
-    flashLeds(CRGB::Blue, 120);
+    // queued and sent from loop() rather than blocking this request - the
+    // status bar reflects the send in real time once loop() drains it
+    queueCodeSend(server.arg("name"));
   }
   finishRequest();
 }
 
 void handleMacro() {
   if (server.hasArg("name")) {
-    fireMacro(server.arg("name"));
-    updateScreen("Macro fired: " + server.arg("name"));
-    flashLeds(CRGB::Blue, 120);
+    queueMacro(server.arg("name"));
   }
   finishRequest();
 }
@@ -836,7 +855,7 @@ void loop() {
       if (it != triggerMap.end()) {
         updateScreen("Trigger matched: " + it->second);
         flashLeds(CRGB::Purple, 150);
-        fireMacro(it->second);
+        queueMacro(it->second);
       } else {
         updateScreen("Signal seen (no trigger match)");
         flashLeds(CRGB::Orange, 150);
@@ -846,12 +865,28 @@ void loop() {
     IrReceiver.resume();
   }
 
-  static unsigned long lastLedUpdate = 0;
-  if (!learning && millis() - lastLedUpdate > 30) {
-    lastLedUpdate = millis();
-    static uint8_t hue = 0;
-    fill_rainbow(leds, NUM_LEDS, hue++, 7);
-    FastLED.show();
+  // drain one queued send per loop iteration (see queueCodeSend/queueMacro) -
+  // the server, receiver, and buttons all still get serviced between sends
+  if (!pendingSends.empty()) {
+    String name = pendingSends.front();
+    pendingSends.erase(pendingSends.begin());
+    sendCodeByName(name);
+    updateScreen("Blasted: " + name);
+    flashLeds(CRGB::Blue, 120);
+  }
+
+  if (ledFlashActive) {
+    if (millis() >= ledFlashUntil) {
+      ledFlashActive = false;
+    }
+  } else {
+    static unsigned long lastLedUpdate = 0;
+    if (!learning && millis() - lastLedUpdate > 30) {
+      lastLedUpdate = millis();
+      static uint8_t hue = 0;
+      fill_rainbow(leds, NUM_LEDS, hue++, 7);
+      FastLED.show();
+    }
   }
 
   // watch for heap fragmentation/leaks over long uptimes: getFreeHeap()
