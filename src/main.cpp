@@ -1129,13 +1129,18 @@ void startSlotLearn(int slot) {
 }
 
 // Idle LED display: each LED mirrors one slot - bright cyan for the
-// selected slot (blinking amber if a learn is pending on it), off for every
-// other slot regardless of whether it's assigned. Replaces the old idle
-// rainbow now that the LEDs mean something.
+// selected slot, off for every other slot regardless of whether it's
+// assigned. The blink for a pending learn tracks pendingLearnSlot rather
+// than currentSlot deliberately: they're normally the same slot, but a
+// physical learn locks in which slot it's for the moment it starts (see
+// startSlotLearn()), and if currentSlot were free to drift away from that
+// slot in the meantime, the blink would follow the wrong LED - showing you
+// were learning into a slot you weren't. Replaces the old idle rainbow now
+// that the LEDs mean something.
 void updateSlotLeds() {
   for (int i = 0; i < NUM_SLOTS && i < NUM_LEDS; i++) {
     CRGB color;
-    if (i == currentSlot && learning) {
+    if (learning && pendingLearnSlot == i) {
       bool on = (millis() / 300) % 2 == 0;
       color = on ? CRGB(80, 60, 0) : CRGB::Black;
     } else if (i == currentSlot) {
@@ -1148,23 +1153,61 @@ void updateSlotLeds() {
   FastLED.show();
 }
 
-unsigned long lastBlastBtn = 0;
+// Debounces a pulled-up button pin: a raw reading only becomes "the truth"
+// once it's held steady for DEBOUNCE_MS. Without this, mechanical contact
+// bounce on press/release (a few ms of rapid HIGH/LOW chatter) can register
+// as several presses and releases for what was physically one press - the
+// likely cause of "weird stuff happening" on button 2 in particular, since
+// its state machine tracks edges (press/release/hold), not just a level.
+const unsigned long DEBOUNCE_MS = 25;
+
+bool debounceButton(int pin, int &lastRaw, unsigned long &lastChangeAt, bool &stable) {
+  int raw = digitalRead(pin);
+  if (raw != lastRaw) {
+    lastRaw = raw;
+    lastChangeAt = millis();
+  }
+  if (millis() - lastChangeAt > DEBOUNCE_MS) {
+    stable = (raw == LOW);  // both buttons are INPUT_PULLUP: LOW = pressed
+  }
+  return stable;
+}
+
+int blastBtnLastRaw = HIGH;
+unsigned long blastBtnLastChangeAt = 0;
+bool blastBtnStable = false;
+bool blastBtnWasDown = false;
+
+int learnBtnLastRaw = HIGH;
+unsigned long learnBtnLastChangeAt = 0;
+bool learnBtnStable = false;
 bool learnBtnDown = false;
 unsigned long learnBtnPressedAt = 0;
 bool learnBtnLongFired = false;
 
 void handlePhysicalButtons() {
-  if (digitalRead(BLAST_BTN_PIN) == LOW && millis() - lastBlastBtn > 300) {
-    lastBlastBtn = millis();
-    if (slotCodeName[currentSlot].length() > 0) {
+  // fires once on the press edge, not once per 300ms while held - the old
+  // level+cooldown check would re-fire repeatedly (e.g. a TV power toggle
+  // firing 2-3 times) if the button was held even slightly too long
+  bool blastIsDown = debounceButton(BLAST_BTN_PIN, blastBtnLastRaw, blastBtnLastChangeAt, blastBtnStable);
+  if (blastIsDown && !blastBtnWasDown) {
+    blastBtnWasDown = true;
+    if (learning) {
+      // sendCode() briefly stops the receiver to transmit - firing here
+      // could eat the very signal a pending learn is waiting to capture,
+      // on top of just being a confusing thing to do mid-learn
+      Serial.println("Blast button ignored - learn in progress");
+    } else if (slotCodeName[currentSlot].length() > 0) {
       queueCodeSend(slotCodeName[currentSlot]);
     } else {
       updateScreen("Slot " + String(currentSlot + 1) + " is empty");
       flashLeds(CRGB::Orange, 150);
     }
+  } else if (!blastIsDown && blastBtnWasDown) {
+    blastBtnWasDown = false;
   }
 
-  bool learnBtnIsDown = (digitalRead(LEARN_BTN_PIN) == LOW);
+  bool learnBtnIsDown = debounceButton(LEARN_BTN_PIN, learnBtnLastRaw, learnBtnLastChangeAt, learnBtnStable);
   if (learnBtnIsDown && !learnBtnDown) {
     learnBtnDown = true;
     learnBtnPressedAt = millis();
@@ -1175,7 +1218,9 @@ void handlePhysicalButtons() {
     startSlotLearn(currentSlot);
   } else if (!learnBtnIsDown && learnBtnDown) {
     learnBtnDown = false;
-    if (!learnBtnLongFired) {
+    // don't let a second short press change which slot is selected while a
+    // physical learn is still waiting on a signal - see updateSlotLeds()
+    if (!learnBtnLongFired && pendingLearnSlot < 0) {
       currentSlot = (currentSlot + 1) % NUM_SLOTS;
       updateScreen("Slot " + String(currentSlot + 1) + " selected");
       markProfileDirty();
