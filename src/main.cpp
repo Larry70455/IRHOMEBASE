@@ -48,6 +48,8 @@ std::map<uint32_t, String> triggerMap;              // hash of a learned code ->
 
 String pendingLearnName = "";  // if set, next captured signal gets saved under this name
 bool learning = false;
+unsigned long learningStartedAt = 0;
+const unsigned long LEARN_TIMEOUT_MS = 30000;  // give up waiting for a signal after 30s
 int pendingLearnSlot = -1;     // if >= 0, the in-progress learn (above) is for this physical slot
 String lastStatus = "Booting...";
 
@@ -71,6 +73,11 @@ int currentSlot = 0;
 volatile bool suppressReceive = false;
 
 void sendCode(const IRCode &code) {
+  if (code.len == 0) {
+    Serial.println("sendCode: skipping empty code (nothing captured)");
+    return;
+  }
+
   Serial.print("Sending raw code, len=");
   Serial.println(code.len);
 
@@ -299,15 +306,31 @@ bool saveProfile() {
   }
   doc["currentSlot"] = currentSlot;
 
-  File f = LittleFS.open(PROFILE_PATH, "w");
+  // write to a temp file and rename it over the real one rather than
+  // writing PROFILE_PATH directly - LittleFS's rename atomically replaces
+  // an existing destination, so profile.json is always either fully the
+  // old version or fully the new one, never a partial write. Without this,
+  // a power loss mid-save (a real risk for a device left plugged in
+  // long-term) could corrupt the one file everything is persisted in.
+  const char* tmpPath = "/profile.json.tmp";
+  File f = LittleFS.open(tmpPath, "w");
   if (!f) {
-    Serial.println("saveProfile: failed to open " PROFILE_PATH " for writing");
+    Serial.println("saveProfile: failed to open temp file for writing");
     return false;
   }
   size_t written = serializeJson(doc, f);
   f.close();
+  if (written == 0) {
+    Serial.println("saveProfile: wrote 0 bytes, aborting");
+    LittleFS.remove(tmpPath);
+    return false;
+  }
+  if (!LittleFS.rename(tmpPath, PROFILE_PATH)) {
+    Serial.println("saveProfile: rename failed");
+    return false;
+  }
   Serial.printf("saveProfile: wrote %u bytes\n", (unsigned)written);
-  return written > 0;
+  return true;
 }
 
 bool loadProfile() {
@@ -416,6 +439,12 @@ String mqttBaseTopic() { return "irhomebase/" + String(hostname); }
 String mqttStatusTopic() { return mqttBaseTopic() + "/status"; }
 String mqttCmdTopic() { return mqttBaseTopic() + "/cmd"; }
 
+// Two differently-named macros can slugify to the same string (e.g. "TV
+// Power" and "TV-Power" both become "tv_power"). Since the slug becomes
+// part of the HA discovery topic and unique_id, a collision would make the
+// second macro's discovery publish silently overwrite the first's entity
+// in Home Assistant. Appending a hash of the exact original name makes the
+// result unique regardless of how the readable part collides.
 String mqttSlug(const String &s) {
   String out;
   out.reserve(s.length());
@@ -428,6 +457,10 @@ String mqttSlug(const String &s) {
     }
   }
   while (out.length() && out.charAt(out.length() - 1) == '_') out.remove(out.length() - 1);
+
+  uint32_t h = 0;
+  for (size_t i = 0; i < s.length(); i++) h = h * 31 + s.charAt(i);
+  out += "_" + String(h, HEX);
   return out;
 }
 
@@ -569,9 +602,13 @@ void sendOverwriteConfirm(const String &kind, const String &redirectUrl, const S
     server.send(409, "application/json", json);
     return;
   }
+  // redirectUrl embeds the raw submitted name (e.g. "/learn?name=" + name) -
+  // escape the whole thing before dropping it into an href, otherwise a
+  // crafted name containing quotes/angle-brackets breaks out of the
+  // attribute and injects into the page
   String html = "<html><body style='font-family:sans-serif'>";
   html += "<p>A " + kind + " named '" + htmlEscape(name) + "' already exists.</p>";
-  html += "<p><a href='" + redirectUrl + "&confirm=1'>Overwrite it</a> | <a href='/'>Cancel</a></p>";
+  html += "<p><a href='" + htmlEscape(redirectUrl) + "&confirm=1'>Overwrite it</a> | <a href='/'>Cancel</a></p>";
   html += "</body></html>";
   server.send(200, "text/html", html);
 }
@@ -886,6 +923,11 @@ void handleRoot() {
 void handleLearn() {
   if (server.hasArg("name")) {
     String name = server.arg("name");
+    name.trim();
+    if (name.length() == 0) {
+      server.send(400, "text/plain", "Name can't be empty");
+      return;
+    }
     bool confirmed = server.hasArg("confirm") && server.arg("confirm") == "1";
     if (codeLibrary.count(name) && !confirmed) {
       sendOverwriteConfirm("code", "/learn?name=" + name, name);
@@ -894,6 +936,7 @@ void handleLearn() {
     pendingLearnName = name;
     pendingLearnSlot = -1;  // this learn came from the web app, not a physical slot
     learning = true;
+    learningStartedAt = millis();
     updateScreen("Point remote & press...");
     flashLeds(CRGB::Yellow, 150);
   }
@@ -921,7 +964,12 @@ void handleMacro() {
 void handleDefineMacro() {
   if (server.hasArg("name") && server.hasArg("codes")) {
     String name = server.arg("name");
+    name.trim();
     String codesStr = server.arg("codes");
+    if (name.length() == 0) {
+      server.send(400, "text/plain", "Name can't be empty");
+      return;
+    }
     bool confirmed = server.hasArg("confirm") && server.arg("confirm") == "1";
     if (macros.count(name) && !confirmed) {
       sendOverwriteConfirm("macro", "/definemacro?name=" + name + "&codes=" + codesStr, name);
@@ -932,8 +980,15 @@ void handleDefineMacro() {
     while (start < (int)codesStr.length()) {
       int comma = codesStr.indexOf(',', start);
       if (comma == -1) comma = codesStr.length();
-      list.push_back(codesStr.substring(start, comma));
+      String piece = codesStr.substring(start, comma);
+      piece.trim();  // "code1, code2" (space after comma) would otherwise
+                      // store " code2", which never matches any real code
+      if (piece.length() > 0) list.push_back(piece);
       start = comma + 1;
+    }
+    if (list.empty()) {
+      server.send(400, "text/plain", "Macro needs at least one code");
+      return;
     }
     macros[name] = list;
     updateScreen("Macro saved: " + name);
@@ -987,6 +1042,7 @@ void handleRenameCode() {
   if (server.hasArg("oldname") && server.hasArg("newname")) {
     String oldName = server.arg("oldname");
     String newName = server.arg("newname");
+    newName.trim();
     auto it = codeLibrary.find(oldName);
     if (it != codeLibrary.end() && newName.length() > 0 && !codeLibrary.count(newName)) {
       codeLibrary[newName] = it->second;
@@ -1029,6 +1085,7 @@ void handleRenameMacro() {
   if (server.hasArg("oldname") && server.hasArg("newname")) {
     String oldName = server.arg("oldname");
     String newName = server.arg("newname");
+    newName.trim();
     auto it = macros.find(oldName);
     if (it != macros.end() && newName.length() > 0 && !macros.count(newName)) {
       mqttClearDiscovery(oldName);
@@ -1067,14 +1124,32 @@ void handleImport() {
     server.send(400, "text/plain", "No profile data in request body");
     return;
   }
+  String body = server.arg("plain");
 
-  File f = LittleFS.open(PROFILE_PATH, "w");
+  // parse-validate BEFORE touching the persisted file. Writing straight to
+  // PROFILE_PATH and validating after (the old approach) meant a malformed
+  // upload would overwrite the working profile with garbage - even though
+  // the request got an error response, the live file was already bad, and
+  // it would fail to load again on the *next* reboot too, silently wiping
+  // everything that used to be there.
+  JsonDocument testDoc;
+  if (deserializeJson(testDoc, body)) {
+    server.send(400, "text/plain", "That file isn't a valid IR Controller profile");
+    return;
+  }
+
+  const char* tmpPath = "/profile.json.tmp";
+  File f = LittleFS.open(tmpPath, "w");
   if (!f) {
     server.send(500, "text/plain", "Failed to open profile for import");
     return;
   }
-  f.print(server.arg("plain"));
+  f.print(body);
   f.close();
+  if (!LittleFS.rename(tmpPath, PROFILE_PATH)) {
+    server.send(500, "text/plain", "Failed to save imported profile");
+    return;
+  }
 
   if (!loadProfile()) {
     server.send(400, "text/plain", "That file isn't a valid IR Controller profile");
@@ -1124,6 +1199,7 @@ void startSlotLearn(int slot) {
   pendingLearnName = name;
   pendingLearnSlot = slot;
   learning = true;
+  learningStartedAt = millis();
   updateScreen("Learning slot " + String(slot + 1) + ": " + name);
   flashLeds(CRGB::Yellow, 150);
 }
@@ -1275,8 +1351,15 @@ void handleWifiWatchdog() {
 // this is the one piece of this change set I can't verify without knowing
 // exactly which core version the build pulls in, so if it fails to compile
 // here specifically, that's why.
+//
+// 25s, not a tighter number, because setup()'s WiFi connect wait alone can
+// take ~10s worst case (see setup()), and LittleFS can take a few seconds
+// to format on a first boot / after corruption - both need to fit under
+// this with real margin, or the watchdog would fire mid-boot on a slow
+// start and reset the device before it ever reaches loop(), which would be
+// a boot-crash-loop every time WiFi just happens to be unreachable.
 #include <esp_task_wdt.h>
-#define WDT_TIMEOUT_S 15
+#define WDT_TIMEOUT_S 25
 
 void initWatchdog() {
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
@@ -1324,6 +1407,7 @@ void setup() {
   updateScreen("Connecting WiFi...");
   int tries = 0;
   while (WiFi.status() != WL_CONNECTED && tries < 40) {
+    esp_task_wdt_reset();  // this loop alone can run ~10s - feed it or risk a mid-boot reset
     delay(250);
     tries++;
   }
@@ -1373,7 +1457,12 @@ void loop() {
 
     IRCode code = captureCurrent();
 
-    if (learning) {
+    if (code.len == 0) {
+      // too short to be a real signal (noise/glitch) - ignore entirely,
+      // including staying in "learning" mode if that's what we were doing,
+      // rather than saving a useless empty code or eating the learn attempt
+      Serial.println("Ignoring empty/noise capture");
+    } else if (learning) {
       codeLibrary[pendingLearnName] = code;
       if (pendingLearnSlot >= 0) {
         slotCodeName[pendingLearnSlot] = pendingLearnName;
@@ -1400,13 +1489,31 @@ void loop() {
   }
 
   // drain one queued send per loop iteration (see queueCodeSend/queueMacro) -
-  // the server, receiver, and buttons all still get serviced between sends
-  if (!pendingSends.empty()) {
+  // the server, receiver, and buttons all still get serviced between sends.
+  // Held back entirely while learning: sendCode() briefly stops the receiver
+  // to transmit, which could eat the very signal a pending learn (web,
+  // physical, or MQTT-triggered) is waiting to capture. The physical blast
+  // button already refuses to even queue during a learn (see
+  // handlePhysicalButtons()) - this covers every other path that can queue
+  // a send (web blast/macro, MQTT command, an auto-triggered macro) so none
+  // of them can interfere either. Sends just wait here until learning ends.
+  if (!pendingSends.empty() && !learning) {
     String name = pendingSends.front();
     pendingSends.erase(pendingSends.begin());
     sendCodeByName(name);
     updateScreen("Blasted: " + name);
     flashLeds(CRGB::Blue, 120);
+  }
+
+  // give up on a learn nobody ever finished (forgot to press the remote,
+  // walked away, etc) - otherwise it blocks the queue above forever and the
+  // screen/LEDs sit showing "waiting for signal" indefinitely
+  if (learning && millis() - learningStartedAt > LEARN_TIMEOUT_MS) {
+    Serial.println("Learn timed out waiting for a signal");
+    updateScreen("Learn timed out");
+    learning = false;
+    pendingLearnName = "";
+    pendingLearnSlot = -1;
   }
 
   if (ledFlashActive) {
