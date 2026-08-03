@@ -7,6 +7,7 @@
 #include <FastLED.h>
 #include <map>
 #include <vector>
+#include <algorithm>
 #include "LGX_Config.h"
 
 #define RECV_PIN 5
@@ -137,14 +138,39 @@ IRCode captureCurrent() {
 }
 
 // ---------- web handlers ----------
+String htmlEscape(const String &s) {
+  String out;
+  out.reserve(s.length());
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s.charAt(i);
+    switch (c) {
+      case '&': out += "&amp;"; break;
+      case '<': out += "&lt;"; break;
+      case '>': out += "&gt;"; break;
+      case '"': out += "&quot;"; break;
+      case '\'': out += "&#39;"; break;
+      default: out += c;
+    }
+  }
+  return out;
+}
+
 void handleRoot() {
   String html = "<html><body style='font-family:sans-serif'>";
   html += "<h2>IR Controller</h2>";
-  html += "<p>" + String(learning ? ("Learning: " + pendingLearnName) : "Idle/listening") + "</p>";
+  html += "<p>" + htmlEscape(learning ? ("Learning: " + pendingLearnName) : "Idle/listening") + "</p>";
 
   html += "<h3>Saved codes</h3><ul>";
   for (auto &kv : codeLibrary) {
-    html += "<li>" + kv.first + " <a href='/blastcode?name=" + kv.first + "'>[blast]</a></li>";
+    String name = htmlEscape(kv.first);
+    html += "<li>" + name;
+    html += " <a href='/blastcode?name=" + name + "'>[blast]</a>";
+    html += " <a href='/deletecode?name=" + name + "' onclick=\"return confirm('Delete " + name + "?')\">[delete]</a>";
+    html += " <form style='display:inline' action='/renamecode' method='get'>";
+    html += "<input type='hidden' name='oldname' value='" + name + "'>";
+    html += "<input name='newname' placeholder='new name' size='12'>";
+    html += "<input type='submit' value='rename'></form>";
+    html += "</li>";
   }
   html += "</ul>";
 
@@ -153,7 +179,15 @@ void handleRoot() {
 
   html += "<h3>Macros</h3><ul>";
   for (auto &kv : macros) {
-    html += "<li>" + kv.first + " <a href='/macro?name=" + kv.first + "'>[fire]</a></li>";
+    String name = htmlEscape(kv.first);
+    html += "<li>" + name;
+    html += " <a href='/macro?name=" + name + "'>[fire]</a>";
+    html += " <a href='/deletemacro?name=" + name + "' onclick=\"return confirm('Delete " + name + "?')\">[delete]</a>";
+    html += " <form style='display:inline' action='/renamemacro' method='get'>";
+    html += "<input type='hidden' name='oldname' value='" + name + "'>";
+    html += "<input name='newname' placeholder='new name' size='12'>";
+    html += "<input type='submit' value='rename'></form>";
+    html += "</li>";
   }
   html += "</ul>";
 
@@ -161,9 +195,25 @@ void handleRoot() {
   server.send(200, "text/html", html);
 }
 
+// shown instead of learning/saving when a name would silently clobber an
+// existing entry - caller must resubmit with confirm=1 to proceed
+void sendOverwriteConfirm(const String &kind, const String &redirectUrl, const String &name) {
+  String html = "<html><body style='font-family:sans-serif'>";
+  html += "<p>A " + kind + " named '" + htmlEscape(name) + "' already exists.</p>";
+  html += "<p><a href='" + redirectUrl + "&confirm=1'>Overwrite it</a> | <a href='/'>Cancel</a></p>";
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
 void handleLearn() {
   if (server.hasArg("name")) {
-    pendingLearnName = server.arg("name");
+    String name = server.arg("name");
+    bool confirmed = server.hasArg("confirm") && server.arg("confirm") == "1";
+    if (codeLibrary.count(name) && !confirmed) {
+      sendOverwriteConfirm("code", "/learn?name=" + name, name);
+      return;
+    }
+    pendingLearnName = name;
     learning = true;
     updateScreen("Point remote & press...");
     flashLeds(CRGB::Yellow, 150);
@@ -198,6 +248,11 @@ void handleDefineMacro() {
   if (server.hasArg("name") && server.hasArg("codes")) {
     String name = server.arg("name");
     String codesStr = server.arg("codes");
+    bool confirmed = server.hasArg("confirm") && server.arg("confirm") == "1";
+    if (macros.count(name) && !confirmed) {
+      sendOverwriteConfirm("macro", "/definemacro?name=" + name + "&codes=" + codesStr, name);
+      return;
+    }
     std::vector<String> list;
     int start = 0;
     while (start < (int)codesStr.length()) {
@@ -223,6 +278,82 @@ void handleLinkTrigger() {
     if (it != codeLibrary.end()) {
       triggerMap[it->second.hash] = macroName;
       updateScreen("Trigger linked: " + codeName);
+    }
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+// /deletecode?name=tv_power
+void handleDeleteCode() {
+  if (server.hasArg("name")) {
+    String name = server.arg("name");
+    auto it = codeLibrary.find(name);
+    if (it != codeLibrary.end()) {
+      uint32_t hash = it->second.hash;
+      codeLibrary.erase(it);
+      triggerMap.erase(hash);
+      for (auto &kv : macros) {
+        auto &list = kv.second;
+        list.erase(std::remove(list.begin(), list.end(), name), list.end());
+      }
+      updateScreen("Deleted code: " + name);
+    }
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+// /renamecode?oldname=tv_power&newname=tv_on
+void handleRenameCode() {
+  if (server.hasArg("oldname") && server.hasArg("newname")) {
+    String oldName = server.arg("oldname");
+    String newName = server.arg("newname");
+    auto it = codeLibrary.find(oldName);
+    if (it != codeLibrary.end() && newName.length() > 0 && !codeLibrary.count(newName)) {
+      codeLibrary[newName] = it->second;
+      codeLibrary.erase(it);
+      for (auto &kv : macros) {
+        for (auto &codeName : kv.second) {
+          if (codeName == oldName) codeName = newName;
+        }
+      }
+      updateScreen("Renamed: " + oldName + " -> " + newName);
+    }
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+// /deletemacro?name=power_all
+void handleDeleteMacro() {
+  if (server.hasArg("name")) {
+    String name = server.arg("name");
+    if (macros.erase(name)) {
+      for (auto it = triggerMap.begin(); it != triggerMap.end(); ) {
+        if (it->second == name) it = triggerMap.erase(it);
+        else ++it;
+      }
+      updateScreen("Deleted macro: " + name);
+    }
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+// /renamemacro?oldname=power_all&newname=movie_time
+void handleRenameMacro() {
+  if (server.hasArg("oldname") && server.hasArg("newname")) {
+    String oldName = server.arg("oldname");
+    String newName = server.arg("newname");
+    auto it = macros.find(oldName);
+    if (it != macros.end() && newName.length() > 0 && !macros.count(newName)) {
+      macros[newName] = it->second;
+      macros.erase(it);
+      for (auto &kv : triggerMap) {
+        if (kv.second == oldName) kv.second = newName;
+      }
+      updateScreen("Renamed macro: " + oldName + " -> " + newName);
     }
   }
   server.sendHeader("Location", "/");
@@ -272,6 +403,10 @@ void setup() {
   server.on("/macro", handleMacro);
   server.on("/definemacro", handleDefineMacro);
   server.on("/linktrigger", handleLinkTrigger);
+  server.on("/deletecode", handleDeleteCode);
+  server.on("/renamecode", handleRenameCode);
+  server.on("/deletemacro", handleDeleteMacro);
+  server.on("/renamemacro", handleRenameMacro);
   server.begin();
 
   // async sender task, pinned to core 0, so core 1's loop() (receiver + web server) never blocks
