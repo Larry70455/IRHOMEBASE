@@ -123,10 +123,9 @@ void flashLeds(CRGB color, int ms) {
 // ---------- capture helper ----------
 IRCode captureCurrent() {
   IRCode code;
-  auto *raw = IrReceiver.decodedIRData.rawDataPtr;
   code.len = 0;
-  for (uint16_t i = 1; i < raw->rawlen && code.len < MAX_RAW_LEN; i++) {
-    code.data[code.len++] = raw->rawbuf[i] * MICROS_PER_TICK;
+  for (uint16_t i = 1; i < IrReceiver.decodedIRData.rawlen && code.len < MAX_RAW_LEN; i++) {
+    code.data[code.len++] = IrReceiver.irparams.rawbuf[i] * MICROS_PER_TICK;
   }
   // bucketed hash of raw timings - tolerant of small jitter, works for ANY protocol
   // including ones IRremote can't decode by name
