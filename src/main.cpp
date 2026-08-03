@@ -62,6 +62,39 @@ String lastStatus = "Booting...";
 String slotCodeName[NUM_SLOTS];  // "" = unassigned
 int currentSlot = 0;
 
+// ---------- customizable display colors ----------
+// Used by both the LEDs and the screen so the two stay visually consistent.
+// Defaults match what used to be hardcoded; adjustable from the web app's
+// "Display colors" section (persisted below in saveProfile/loadProfile).
+CRGB accentColor = CRGB(0, 90, 100);    // selected slot
+CRGB assignedColor = CRGB(0, 60, 20);   // unselected slot that has a code
+CRGB waveColor = CRGB(0, 60, 220);      // transmit sweep
+
+String colorToHex(const CRGB &c) {
+  char buf[8];
+  snprintf(buf, sizeof(buf), "#%02x%02x%02x", c.r, c.g, c.b);
+  return String(buf);
+}
+
+CRGB parseHexColor(const String &hex, CRGB fallback) {
+  String h = hex;
+  if (h.startsWith("#")) h = h.substring(1);
+  if (h.length() != 6) return fallback;
+  for (size_t i = 0; i < 6; i++) {
+    if (!isxdigit((unsigned char)h.charAt(i))) return fallback;
+  }
+  long v = strtol(h.c_str(), nullptr, 16);
+  return CRGB((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF);
+}
+
+// picks black or white text for legibility against an arbitrary
+// user-chosen background color, since a custom accent color might not be
+// as reliably light as the old hardcoded cyan was
+uint16_t contrastTextColor(const CRGB &bg) {
+  int luminance = (bg.r * 299 + bg.g * 587 + bg.b * 114) / 1000;
+  return (luminance > 140) ? TFT_BLACK : TFT_WHITE;
+}
+
 // ---------- IR sending ----------
 // Sent synchronously, on the same core/task as the receiver (setup()/loop()
 // run on core 1) and the web server. IRremote's ESP32 timer-based send/receive
@@ -176,6 +209,13 @@ void drawWifiIcon(int x, int y) {
   }
 }
 
+// Same three states as the LEDs (see updateSlotLeds()): filled accentColor
+// for the selected slot, a colored assignedColor outline for any other slot
+// that has a code, plain white outline for a genuinely empty one - so you
+// can tell a slot is set without cycling to it. Each cell shows the
+// assigned code's name (truncated to fit) instead of just a slot number,
+// so renaming a code (already supported) is all it takes to relabel what a
+// slot is for.
 void drawSlotGrid(int gridX, int gridY, int cellW, int cellH, int gap) {
   tft.setFont(&fonts::FreeSansBold9pt7b);
   tft.setTextDatum(textdatum_t::middle_center);
@@ -185,15 +225,29 @@ void drawSlotGrid(int gridX, int gridY, int cellW, int cellH, int gap) {
     int cx = gridX + col * (cellW + gap);
     int cy = gridY + row * (cellH + gap);
     bool selected = (i == currentSlot);
+    bool assigned = slotCodeName[i].length() > 0;
+
+    uint16_t fillColor, borderColor, textColor;
     if (selected) {
-      tft.fillRoundRect(cx, cy, cellW, cellH, 6, TFT_CYAN);
-      tft.setTextColor(TFT_BLACK, TFT_CYAN);
+      fillColor = tft.color565(accentColor.r, accentColor.g, accentColor.b);
+      borderColor = fillColor;
+      textColor = contrastTextColor(accentColor);
+    } else if (assigned) {
+      fillColor = TFT_BLACK;
+      borderColor = tft.color565(assignedColor.r, assignedColor.g, assignedColor.b);
+      textColor = TFT_WHITE;
     } else {
-      tft.fillRoundRect(cx, cy, cellW, cellH, 6, TFT_BLACK);
-      tft.drawRoundRect(cx, cy, cellW, cellH, 6, TFT_WHITE);
-      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      fillColor = TFT_BLACK;
+      borderColor = TFT_WHITE;
+      textColor = TFT_WHITE;
     }
-    tft.drawString(String(i + 1), cx + cellW / 2, cy + cellH / 2);
+
+    tft.fillRoundRect(cx, cy, cellW, cellH, 6, fillColor);
+    tft.drawRoundRect(cx, cy, cellW, cellH, 6, borderColor);
+    tft.setTextColor(textColor, fillColor);
+
+    String label = assigned ? slotCodeName[i] : "-";
+    tft.drawString(truncateToWidth(label, cellW - 6), cx + cellW / 2, cy + cellH / 2);
   }
   tft.setTextDatum(textdatum_t::top_left);
 }
@@ -210,10 +264,11 @@ void updateScreen(String status) {
   tft.fillScreen(TFT_BLACK);
 
   // header
-  tft.fillRect(0, 0, SCREEN_W, 44, TFT_CYAN);
+  uint16_t accent565 = tft.color565(accentColor.r, accentColor.g, accentColor.b);
+  tft.fillRect(0, 0, SCREEN_W, 44, accent565);
   tft.setFont(&fonts::FreeSansBold12pt7b);
   tft.setTextDatum(textdatum_t::middle_center);
-  tft.setTextColor(TFT_BLACK, TFT_CYAN);
+  tft.setTextColor(contrastTextColor(accentColor), accent565);
   tft.drawString("IR Controller", SCREEN_W / 2, 22);
   tft.setTextDatum(textdatum_t::top_left);
 
@@ -253,6 +308,20 @@ void flashLeds(CRGB color, int ms) {
   FastLED.show();
   ledFlashActive = true;
   ledFlashUntil = millis() + ms;
+}
+
+// Visual "signal going out" cue: lights one LED at a time, 1 through 8, in
+// place of the old solid flash after a send. This plays after the actual
+// (blocking) transmission has already finished - the real send is too fast
+// to visualize live - but reads as "there it goes" immediately after.
+bool ledWaveActive = false;
+unsigned long ledWaveStartedAt = 0;
+const unsigned long LED_WAVE_STEP_MS = 60;
+
+void startTransmitWave() {
+  ledFlashActive = false;  // wave takes over the strip immediately
+  ledWaveActive = true;
+  ledWaveStartedAt = millis();
 }
 
 // ---------- capture helper ----------
@@ -305,6 +374,11 @@ bool saveProfile() {
     slotsArr.add(slotCodeName[i]);
   }
   doc["currentSlot"] = currentSlot;
+
+  JsonObject colorsObj = doc["colors"].to<JsonObject>();
+  colorsObj["accent"] = colorToHex(accentColor);
+  colorsObj["assigned"] = colorToHex(assignedColor);
+  colorsObj["wave"] = colorToHex(waveColor);
 
   // write to a temp file and rename it over the real one rather than
   // writing PROFILE_PATH directly - LittleFS's rename atomically replaces
@@ -399,6 +473,14 @@ bool loadProfile() {
   }
   currentSlot = doc["currentSlot"] | 0;
   if (currentSlot < 0 || currentSlot >= NUM_SLOTS) currentSlot = 0;
+
+  JsonObject colorsObj = doc["colors"].as<JsonObject>();
+  const char* accentHex = colorsObj["accent"].as<const char*>();
+  if (accentHex) accentColor = parseHexColor(accentHex, accentColor);
+  const char* assignedHex = colorsObj["assigned"].as<const char*>();
+  if (assignedHex) assignedColor = parseHexColor(assignedHex, assignedColor);
+  const char* waveHex = colorsObj["wave"].as<const char*>();
+  if (waveHex) waveColor = parseHexColor(waveHex, waveColor);
 
   Serial.printf("loadProfile: loaded %u codes, %u macros, %u triggers\n",
                 (unsigned)codeLibrary.size(), (unsigned)macros.size(), (unsigned)triggerMap.size());
@@ -619,7 +701,7 @@ void handleApiState() {
   // do on nearly every line below, which is a steady source of heap
   // fragmentation on a device that stays powered on for a long time
   String json;
-  json.reserve(260 + 24 * (codeLibrary.size() + macros.size()));
+  json.reserve(340 + 24 * (codeLibrary.size() + macros.size()));
   json += "{";
   json += "\"status\":\"" + jsonEscape(lastStatus) + "\",";
   json += "\"learning\":" + String(learning ? "true" : "false") + ",";
@@ -649,7 +731,13 @@ void handleApiState() {
     if (i > 0) json += ",";
     json += "\"" + jsonEscape(slotCodeName[i]) + "\"";
   }
-  json += "]}";
+  json += "],";
+
+  json += "\"colors\":{";
+  json += "\"accent\":\"" + colorToHex(accentColor) + "\",";
+  json += "\"assigned\":\"" + colorToHex(assignedColor) + "\",";
+  json += "\"wave\":\"" + colorToHex(waveColor) + "\"";
+  json += "}}";
 
   server.send(200, "application/json", json);
 }
@@ -682,6 +770,7 @@ static const char PAGE_HTML[] PROGMEM = R"HTML(<!doctype html>
   body.busy button { opacity:0.5; pointer-events:none; }
   input[type=text] { font-size:1rem; padding:10px; border-radius:8px; border:1px solid #555; background:#222; color:#eee; width:100%; }
   select { font-size:0.95rem; padding:8px; border-radius:8px; border:1px solid #555; background:#222; color:#eee; flex:1 1 auto; min-width:0; }
+  input[type=color] { width:52px; height:38px; padding:2px; border-radius:8px; border:1px solid #555; background:#222; }
   .item.selected-slot { outline:2px solid #4cf4f4; }
   form.inline { display:flex; flex-direction:column; gap:8px; background:#1c1c1c; border-radius:10px; padding:12px; }
 </style>
@@ -711,6 +800,20 @@ static const char PAGE_HTML[] PROGMEM = R"HTML(<!doctype html>
   <input type='text' id='macroCodes' placeholder='code1,code2,code3' autocomplete='off'>
   <button type='submit'>Save macro</button>
 </form>
+
+<h2>Display colors</h2>
+<div class='item'>
+  <span class='name'>Selected slot</span>
+  <input type='color' id='colorAccent'>
+</div>
+<div class='item'>
+  <span class='name'>Assigned indicator</span>
+  <input type='color' id='colorAssigned'>
+</div>
+<div class='item'>
+  <span class='name'>Transmit wave</span>
+  <input type='color' id='colorWave'>
+</div>
 
 <h2>Backup</h2>
 <div class='item'>
@@ -818,10 +921,22 @@ document.getElementById('importFile').addEventListener('change', async function 
 
 function assignSlot(slotIndex, name) { mutate('/assignslot', {slot: String(slotIndex), name: name}); }
 
+function setColor(key, hex) { mutate('/setcolors', {[key]: hex}); }
+document.getElementById('colorAccent').addEventListener('change', function () { setColor('accent', this.value); });
+document.getElementById('colorAssigned').addEventListener('change', function () { setColor('assigned', this.value); });
+document.getElementById('colorWave').addEventListener('change', function () { setColor('wave', this.value); });
+
 function render(state) {
   const bar = document.getElementById('statusBar');
   bar.textContent = state.status + (state.learning ? ' (' + state.pendingName + ')' : '');
   bar.className = state.learning ? 'learning' : '';
+
+  // don't stomp a picker the user currently has open
+  [['colorAccent', state.colors.accent], ['colorAssigned', state.colors.assigned], ['colorWave', state.colors.wave]]
+    .forEach(function (pair) {
+      const input = document.getElementById(pair[0]);
+      if (document.activeElement !== input) input.value = pair[1];
+    });
 
   const slotsDiv = document.getElementById('slots');
   slotsDiv.innerHTML = '';
@@ -1183,6 +1298,18 @@ void handleAssignSlot() {
   finishRequest();
 }
 
+// /setcolors?accent=%23rrggbb&assigned=%23rrggbb&wave=%23rrggbb - any
+// subset of the three; an invalid hex value is silently ignored (keeps the
+// previous color) rather than erroring, since this is just cosmetic
+void handleSetColors() {
+  if (server.hasArg("accent")) accentColor = parseHexColor(server.arg("accent"), accentColor);
+  if (server.hasArg("assigned")) assignedColor = parseHexColor(server.arg("assigned"), assignedColor);
+  if (server.hasArg("wave")) waveColor = parseHexColor(server.arg("wave"), waveColor);
+  updateScreen(lastStatus);  // redraw now so the new colors are visible immediately
+  markProfileDirty();
+  finishRequest();
+}
+
 // ---------- physical control: 2 buttons + 8 LEDs as slot indicators ----------
 // Button 1 fires whichever slot is selected. Button 2 short-press cycles
 // slots; held past LONG_PRESS_MS it learns into the current slot instead,
@@ -1204,15 +1331,16 @@ void startSlotLearn(int slot) {
   flashLeds(CRGB::Yellow, 150);
 }
 
-// Idle LED display: each LED mirrors one slot - bright cyan for the
-// selected slot, off for every other slot regardless of whether it's
-// assigned. The blink for a pending learn tracks pendingLearnSlot rather
-// than currentSlot deliberately: they're normally the same slot, but a
-// physical learn locks in which slot it's for the moment it starts (see
-// startSlotLearn()), and if currentSlot were free to drift away from that
-// slot in the meantime, the blink would follow the wrong LED - showing you
-// were learning into a slot you weren't. Replaces the old idle rainbow now
-// that the LEDs mean something.
+// Idle LED display: each LED mirrors one slot. Three states so you can
+// actually tell a slot is set without cycling to it: accentColor for the
+// selected slot, a dimmer assignedColor for any other slot that has a code,
+// off for a genuinely empty slot. The blink for a pending learn tracks
+// pendingLearnSlot rather than currentSlot deliberately: they're normally
+// the same slot, but a physical learn locks in which slot it's for the
+// moment it starts (see startSlotLearn()), and if currentSlot were free to
+// drift away from that slot in the meantime, the blink would follow the
+// wrong LED - showing you were learning into a slot you weren't. Replaces
+// the old idle rainbow now that the LEDs mean something.
 void updateSlotLeds() {
   for (int i = 0; i < NUM_SLOTS && i < NUM_LEDS; i++) {
     CRGB color;
@@ -1220,9 +1348,11 @@ void updateSlotLeds() {
       bool on = (millis() / 300) % 2 == 0;
       color = on ? CRGB(80, 60, 0) : CRGB::Black;
     } else if (i == currentSlot) {
-      color = CRGB(0, 90, 100);
+      color = accentColor;
+    } else if (slotCodeName[i].length() > 0) {
+      color = assignedColor;
     } else {
-      color = CRGB::Black;  // unselected slots are just off, assigned or not
+      color = CRGB::Black;
     }
     leds[i] = color;
   }
@@ -1438,6 +1568,7 @@ void setup() {
   server.on("/export", HTTP_GET, handleExport);
   server.on("/import", HTTP_POST, handleImport);
   server.on("/assignslot", handleAssignSlot);
+  server.on("/setcolors", handleSetColors);
   server.begin();
 
   updateScreen("Ready");
@@ -1502,7 +1633,7 @@ void loop() {
     pendingSends.erase(pendingSends.begin());
     sendCodeByName(name);
     updateScreen("Blasted: " + name);
-    flashLeds(CRGB::Blue, 120);
+    startTransmitWave();
   }
 
   // give up on a learn nobody ever finished (forgot to press the remote,
@@ -1516,7 +1647,17 @@ void loop() {
     pendingLearnSlot = -1;
   }
 
-  if (ledFlashActive) {
+  if (ledWaveActive) {
+    unsigned long elapsed = millis() - ledWaveStartedAt;
+    int step = elapsed / LED_WAVE_STEP_MS;
+    if (step >= NUM_LEDS) {
+      ledWaveActive = false;
+    } else {
+      fill_solid(leds, NUM_LEDS, CRGB::Black);
+      leds[step] = waveColor;
+      FastLED.show();
+    }
+  } else if (ledFlashActive) {
     if (millis() >= ledFlashUntil) {
       ledFlashActive = false;
     }
