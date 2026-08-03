@@ -7,9 +7,11 @@
 #include <FastLED.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
+#include <PubSubClient.h>
 #include <map>
 #include <vector>
 #include <algorithm>
+#include <ctype.h>
 #include "LGX_Config.h"
 
 #define PROFILE_PATH "/profile.json"
@@ -119,30 +121,117 @@ void queueMacro(const String &macroName) {
 }
 
 // ---------- screen / LEDs ----------
+// Panel is 240x320 portrait (see LGX_Config.h). Every piece of text below is
+// measured with textWidth() and truncated to fit its box before drawing -
+// deliberately not relying on the library's own word-wrap, so nothing can
+// ever run off the edge of the panel regardless of exact font metrics.
+const int SCREEN_W = 240;
+const int SCREEN_H = 320;
+const uint8_t SCREEN_BRIGHTNESS = 180;
+bool screenAsleep = false;
+unsigned long lastActivityAt = 0;
+const unsigned long SCREENSAVER_TIMEOUT_MS = 120000;  // 2 min idle -> sleep
+
+// Trims s until "s..." fits within maxWidth (assumes the current font is
+// already set). Never overflows maxWidth, whatever the font's real metrics.
+String truncateToWidth(const String &s, int maxWidth) {
+  if (tft.textWidth(s) <= maxWidth) return s;
+  String t = s;
+  while (t.length() > 1 && tft.textWidth(t + "...") > maxWidth) {
+    t.remove(t.length() - 1);
+  }
+  return t + "...";
+}
+
+// Up to 2 lines: splits on the first space (status messages here are all
+// short phrases like "Learned: Button 3", not paragraphs), truncating each
+// resulting line independently so neither can overflow maxWidth.
+void drawStatusText(const String &text, int x, int y, int maxWidth, int lineHeight) {
+  if (tft.textWidth(text) <= maxWidth) {
+    tft.drawString(text, x, y);
+    return;
+  }
+  int splitAt = text.indexOf(' ');
+  if (splitAt == -1) {
+    tft.drawString(truncateToWidth(text, maxWidth), x, y);
+    return;
+  }
+  tft.drawString(truncateToWidth(text.substring(0, splitAt), maxWidth), x, y);
+  tft.drawString(truncateToWidth(text.substring(splitAt + 1), maxWidth), x, y + lineHeight);
+}
+
+void drawWifiIcon(int x, int y) {
+  uint16_t color = (WiFi.status() == WL_CONNECTED) ? TFT_GREEN : TFT_RED;
+  const int barW = 4, gap = 2;
+  const int heights[4] = {4, 8, 12, 16};
+  for (int i = 0; i < 4; i++) {
+    tft.fillRect(x + i * (barW + gap), y + (16 - heights[i]), barW, heights[i], color);
+  }
+}
+
+void drawSlotGrid(int gridX, int gridY, int cellW, int cellH, int gap) {
+  tft.setFont(&fonts::FreeSansBold9pt7b);
+  tft.setTextDatum(textdatum_t::middle_center);
+  for (int i = 0; i < NUM_SLOTS; i++) {
+    int col = i % 4;
+    int row = i / 4;
+    int cx = gridX + col * (cellW + gap);
+    int cy = gridY + row * (cellH + gap);
+    bool selected = (i == currentSlot);
+    if (selected) {
+      tft.fillRoundRect(cx, cy, cellW, cellH, 6, TFT_CYAN);
+      tft.setTextColor(TFT_BLACK, TFT_CYAN);
+    } else {
+      tft.fillRoundRect(cx, cy, cellW, cellH, 6, TFT_BLACK);
+      tft.drawRoundRect(cx, cy, cellW, cellH, 6, TFT_WHITE);
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    }
+    tft.drawString(String(i + 1), cx + cellW / 2, cy + cellH / 2);
+  }
+  tft.setTextDatum(textdatum_t::top_left);
+}
+
 void updateScreen(String status) {
   lastStatus = status;
+  lastActivityAt = millis();
+  if (screenAsleep) {
+    screenAsleep = false;
+    tft.setBrightness(SCREEN_BRIGHTNESS);
+  }
 
-  tft.fillRect(0, 0, 240, 160, TFT_BLACK);
-  tft.setCursor(5, 5);
-  tft.setTextSize(2);
-  tft.setTextColor(TFT_GREEN, TFT_BLACK);
-  tft.println("IR Controller");
+  tft.startWrite();
+  tft.fillScreen(TFT_BLACK);
 
-  tft.setCursor(5, 35);
+  // header
+  tft.fillRect(0, 0, SCREEN_W, 44, TFT_CYAN);
+  tft.setFont(&fonts::FreeSansBold12pt7b);
+  tft.setTextDatum(textdatum_t::middle_center);
+  tft.setTextColor(TFT_BLACK, TFT_CYAN);
+  tft.drawString("IR Controller", SCREEN_W / 2, 22);
+  tft.setTextDatum(textdatum_t::top_left);
+
+  // status (up to 2 lines)
+  tft.setFont(&fonts::FreeSans9pt7b);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.println(status);
+  drawStatusText(status, 10, 56, SCREEN_W - 20, 22);
 
-  tft.setCursor(5, 60);
-  tft.print("Codes saved: ");
-  tft.println((int)codeLibrary.size());
+  // 8-slot grid, mirrors the physical LEDs
+  drawSlotGrid(12, 110, 48, 44, 8);
 
-  tft.setCursor(5, 85);
-  tft.println(learning ? ("LEARNING: " + pendingLearnName) : "MODE: idle/listening");
+  // footer: WiFi status, hostname, code count, current slot
+  tft.setFont(&fonts::FreeSans9pt7b);
+  drawWifiIcon(10, 224);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  String host = String(hostname) + ".local";
+  tft.drawString(truncateToWidth(host, SCREEN_W - 40), 34, 224);
 
-  tft.setCursor(5, 110);
-  tft.print("http://");
-  tft.print(hostname);
-  tft.println(".local");
+  tft.drawString("Codes: " + String((int)codeLibrary.size()), 10, 250);
+
+  String slotLine = "Slot " + String(currentSlot + 1) + ": " +
+                     (slotCodeName[currentSlot].length() ? slotCodeName[currentSlot] : "(empty)");
+  tft.drawString(truncateToWidth(slotLine, SCREEN_W - 20), 10, 272);
+
+  tft.endWrite();
 }
 
 // Sets the LEDs immediately and returns without blocking; loop() reverts
@@ -306,6 +395,124 @@ const unsigned long PROFILE_SAVE_DEBOUNCE_MS = 500;
 void markProfileDirty() {
   profileDirty = true;
   profileDirtyAt = millis();
+}
+
+// ---------- MQTT / Home Assistant bridge (optional) ----------
+// Fill in mqtt_server to enable - left blank, this feature just never
+// connects and costs nothing. Publishes one HA "button" entity per macro via
+// MQTT discovery (shows up in Home Assistant automatically, no YAML needed)
+// and listens on a single command topic for a macro or code name to fire -
+// covers the roadmap's "voice control of macros via HA" with whatever
+// assistant HA is already wired to.
+const char* mqtt_server = "";  // e.g. "192.168.1.50" - blank disables MQTT entirely
+const uint16_t mqtt_port = 1883;
+const char* mqtt_user = "";
+const char* mqtt_password = "";
+
+WiFiClient mqttWifiClient;
+PubSubClient mqttClient(mqttWifiClient);
+
+String mqttBaseTopic() { return "irhomebase/" + String(hostname); }
+String mqttStatusTopic() { return mqttBaseTopic() + "/status"; }
+String mqttCmdTopic() { return mqttBaseTopic() + "/cmd"; }
+
+String mqttSlug(const String &s) {
+  String out;
+  out.reserve(s.length());
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s.charAt(i);
+    if (isalnum((unsigned char)c)) {
+      out += (char)tolower(c);
+    } else if (out.length() && out.charAt(out.length() - 1) != '_') {
+      out += '_';
+    }
+  }
+  while (out.length() && out.charAt(out.length() - 1) == '_') out.remove(out.length() - 1);
+  return out;
+}
+
+// removes one macro's HA entity - an empty retained payload on its discovery
+// topic tells HA to forget it. Call before a macro is renamed/deleted so it
+// doesn't leave a stale duplicate behind.
+void mqttClearDiscovery(const String &macroName) {
+  if (!mqttClient.connected()) return;
+  String deviceId = "irhomebase_" + String(hostname);
+  String topic = "homeassistant/button/" + deviceId + "_" + mqttSlug(macroName) + "/config";
+  mqttClient.publish(topic.c_str(), "", true);
+}
+
+void mqttPublishDiscovery() {
+  if (!mqttClient.connected()) return;
+  String deviceId = "irhomebase_" + String(hostname);
+  for (auto &kv : macros) {
+    JsonDocument doc;
+    doc["name"] = kv.first;
+    doc["unique_id"] = deviceId + "_" + mqttSlug(kv.first);
+    doc["command_topic"] = mqttCmdTopic();
+    doc["payload_press"] = kv.first;
+    doc["availability_topic"] = mqttStatusTopic();
+    JsonObject device = doc["device"].to<JsonObject>();
+    device["identifiers"][0] = deviceId;
+    device["name"] = "IR Controller (" + String(hostname) + ")";
+    device["manufacturer"] = "IRHOMEBASE";
+
+    String payload;
+    serializeJson(doc, payload);
+    String topic = "homeassistant/button/" + deviceId + "_" + mqttSlug(kv.first) + "/config";
+    mqttClient.publish(topic.c_str(), payload.c_str(), true);
+  }
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String msg;
+  msg.reserve(length);
+  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+  Serial.println("MQTT command: " + msg);
+  if (macros.count(msg)) {
+    queueMacro(msg);
+  } else if (codeLibrary.count(msg)) {
+    queueCodeSend(msg);
+  } else {
+    Serial.println("MQTT command: no macro or code named '" + msg + "'");
+  }
+}
+
+unsigned long lastMqttAttempt = 0;
+const unsigned long MQTT_RETRY_MS = 5000;
+
+// Non-blocking: connect attempts are spaced out and mqttClient.loop() just
+// services already-open sockets, so this is safe to call every loop().
+void handleMqtt() {
+  if (strlen(mqtt_server) == 0) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  if (!mqttClient.connected()) {
+    if (millis() - lastMqttAttempt < MQTT_RETRY_MS) return;
+    lastMqttAttempt = millis();
+    mqttClient.setServer(mqtt_server, mqtt_port);
+    mqttClient.setCallback(mqttCallback);
+    // default PubSubClient packet buffer (256 bytes) is too small for an HA
+    // discovery payload once the device block is included - publish() fails
+    // silently rather than erroring, so this is easy to miss without it
+    mqttClient.setBufferSize(512);
+    String clientId = "irhomebase-" + String(hostname);
+    String statusTopic = mqttStatusTopic();
+    bool ok = mqttClient.connect(clientId.c_str(),
+                                  strlen(mqtt_user) ? mqtt_user : nullptr,
+                                  strlen(mqtt_user) ? mqtt_password : nullptr,
+                                  statusTopic.c_str(), 0, true, "offline");
+    if (ok) {
+      Serial.println("MQTT connected");
+      mqttClient.publish(statusTopic.c_str(), "online", true);
+      mqttClient.subscribe(mqttCmdTopic().c_str());
+      mqttPublishDiscovery();
+    } else {
+      Serial.printf("MQTT connect failed, rc=%d\n", mqttClient.state());
+    }
+    return;
+  }
+
+  mqttClient.loop();
 }
 
 // ---------- web handlers ----------
@@ -643,13 +850,21 @@ function render(state) {
   });
 }
 
+let lastStateJson = null;
+
 async function refresh() {
   if (pollBusy) return; // previous poll still in flight - don't stack another one
   pollBusy = true;
   try {
     const res = await fetch('/api/state');
-    const state = await res.json();
-    render(state);
+    const text = await res.text();
+    // skip the DOM rebuild when nothing changed - otherwise every 1s poll
+    // tears down and rebuilds the slot <select> dropdowns, which can
+    // interrupt one you have open on some mobile browsers
+    if (text !== lastStateJson) {
+      lastStateJson = text;
+      render(JSON.parse(text));
+    }
   } catch (e) {
     // transient - next poll will retry
   } finally {
@@ -723,6 +938,7 @@ void handleDefineMacro() {
     macros[name] = list;
     updateScreen("Macro saved: " + name);
     markProfileDirty();
+    mqttPublishDiscovery();
   }
   finishRequest();
 }
@@ -794,7 +1010,9 @@ void handleRenameCode() {
 void handleDeleteMacro() {
   if (server.hasArg("name")) {
     String name = server.arg("name");
-    if (macros.erase(name)) {
+    if (macros.count(name)) {
+      mqttClearDiscovery(name);
+      macros.erase(name);
       for (auto it = triggerMap.begin(); it != triggerMap.end(); ) {
         if (it->second == name) it = triggerMap.erase(it);
         else ++it;
@@ -813,6 +1031,7 @@ void handleRenameMacro() {
     String newName = server.arg("newname");
     auto it = macros.find(oldName);
     if (it != macros.end() && newName.length() > 0 && !macros.count(newName)) {
+      mqttClearDiscovery(oldName);
       macros[newName] = it->second;
       macros.erase(it);
       for (auto &kv : triggerMap) {
@@ -820,6 +1039,7 @@ void handleRenameMacro() {
       }
       updateScreen("Renamed macro: " + oldName + " -> " + newName);
       markProfileDirty();
+      mqttPublishDiscovery();
     }
   }
   finishRequest();
@@ -908,23 +1128,20 @@ void startSlotLearn(int slot) {
   flashLeds(CRGB::Yellow, 150);
 }
 
-// Idle LED display: each LED mirrors one slot - bright for the selected
-// slot (blinking if a learn is pending on it), dim green if assigned, off
-// if empty. Replaces the old idle rainbow now that the LEDs mean something.
+// Idle LED display: each LED mirrors one slot - bright cyan for the
+// selected slot (blinking amber if a learn is pending on it), off for every
+// other slot regardless of whether it's assigned. Replaces the old idle
+// rainbow now that the LEDs mean something.
 void updateSlotLeds() {
   for (int i = 0; i < NUM_SLOTS && i < NUM_LEDS; i++) {
-    bool selected = (i == currentSlot);
-    bool assigned = slotCodeName[i].length() > 0;
     CRGB color;
-    if (selected && learning) {
+    if (i == currentSlot && learning) {
       bool on = (millis() / 300) % 2 == 0;
       color = on ? CRGB(80, 60, 0) : CRGB::Black;
-    } else if (selected) {
+    } else if (i == currentSlot) {
       color = CRGB(0, 90, 100);
-    } else if (assigned) {
-      color = CRGB(0, 25, 0);
     } else {
-      color = CRGB::Black;
+      color = CRGB::Black;  // unselected slots are just off, assigned or not
     }
     leds[i] = color;
   }
@@ -966,9 +1183,75 @@ void handlePhysicalButtons() {
   }
 }
 
+// ---------- WiFi reconnect watchdog ----------
+// WiFi.begin() only kicks off a connection attempt - it doesn't block
+// waiting for it - so this stays non-blocking, checked once per loop().
+// Backs off up to 30s between attempts so a real outage doesn't spam
+// reconnect attempts forever.
+bool wifiWasConnected = true;
+unsigned long lastWifiRetryAt = 0;
+unsigned long wifiRetryIntervalMs = 3000;
+const unsigned long WIFI_RETRY_MAX_MS = 30000;
+
+void mdnsStart() {
+  if (MDNS.begin(hostname)) {
+    MDNS.addService("http", "tcp", 80);
+  }
+}
+
+void handleWifiWatchdog() {
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!wifiWasConnected) {
+      Serial.println("WiFi reconnected");
+      updateScreen("WiFi reconnected");
+      mdnsStart();  // mDNS doesn't reliably survive a reconnect on its own
+      wifiRetryIntervalMs = 3000;
+    }
+    wifiWasConnected = true;
+    return;
+  }
+
+  wifiWasConnected = false;
+  if (millis() - lastWifiRetryAt < wifiRetryIntervalMs) return;
+  lastWifiRetryAt = millis();
+  Serial.println("WiFi disconnected, reconnecting...");
+  updateScreen("WiFi reconnecting...");
+  WiFi.disconnect();
+  WiFi.begin(ssid, password);
+  wifiRetryIntervalMs = min(wifiRetryIntervalMs * 2, WIFI_RETRY_MAX_MS);
+}
+
+// ---------- task watchdog ----------
+// Resets the device if loop() ever stops coming back around within
+// WDT_TIMEOUT_S - a safety net against any future blocking bug (this one
+// has already been hunted down and fixed a few times this session) hanging
+// the device silently instead of recovering on its own. The config API
+// changed between arduino-esp32 2.x and 3.x (IDF4 vs IDF5), hence the guard -
+// this is the one piece of this change set I can't verify without knowing
+// exactly which core version the build pulls in, so if it fails to compile
+// here specifically, that's why.
+#include <esp_task_wdt.h>
+#define WDT_TIMEOUT_S 15
+
+void initWatchdog() {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  esp_task_wdt_config_t wdtConfig = {
+    .timeout_ms = WDT_TIMEOUT_S * 1000,
+    .idle_core_mask = 0,
+    .trigger_panic = true,
+  };
+  esp_task_wdt_init(&wdtConfig);
+#else
+  esp_task_wdt_init(WDT_TIMEOUT_S, true);
+#endif
+  esp_task_wdt_add(NULL);
+}
+
 void setup() {
   Serial.begin(115200);
   delay(500);
+
+  initWatchdog();  // arm early so a hang anywhere in setup() is also caught
 
   if (!LittleFS.begin(true)) {
     Serial.println("LittleFS mount failed - codes/macros will not persist");
@@ -981,6 +1264,8 @@ void setup() {
 
   tft.init();
   tft.setRotation(0);
+  tft.setTextWrap(false);  // all text is measured/truncated manually - never let the library wrap
+  tft.setBrightness(SCREEN_BRIGHTNESS);
   tft.fillScreen(TFT_BLACK);
   updateScreen("Booting...");
 
@@ -1000,11 +1285,14 @@ void setup() {
 
   if (WiFi.status() == WL_CONNECTED) {
     updateScreen("WiFi connected");
-    if (MDNS.begin(hostname)) {
-      MDNS.addService("http", "tcp", 80);
-    }
+    mdnsStart();
+    wifiWasConnected = true;
   } else {
     updateScreen("WiFi FAILED");
+    // not fatal - handleWifiWatchdog() in loop() keeps retrying in the
+    // background, so the device still comes up (physical buttons/screen/IR
+    // all work without WiFi) and joins the network whenever it's available
+    wifiWasConnected = false;
   }
 
   server.on("/", handleRoot);
@@ -1027,7 +1315,10 @@ void setup() {
 }
 
 void loop() {
+  esp_task_wdt_reset();
   server.handleClient();
+  handleWifiWatchdog();
+  handleMqtt();
 
   handlePhysicalButtons();
 
@@ -1090,6 +1381,15 @@ void loop() {
   if (profileDirty && millis() - profileDirtyAt >= PROFILE_SAVE_DEBOUNCE_MS) {
     profileDirty = false;
     saveProfile();
+  }
+
+  // screensaver: blank the backlight after idle. Any updateScreen() call
+  // (button press, blast, learn, WiFi status change, ...) counts as
+  // activity and wakes it - see updateScreen(). Web polling does NOT count,
+  // since /api/state alone doesn't call updateScreen().
+  if (!screenAsleep && millis() - lastActivityAt > SCREENSAVER_TIMEOUT_MS) {
+    screenAsleep = true;
+    tft.setBrightness(0);
   }
 
   // watch for heap fragmentation/leaks over long uptimes: getFreeHeap()
