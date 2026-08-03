@@ -264,6 +264,21 @@ bool loadProfile() {
   return true;
 }
 
+// saveProfile() does a synchronous flash write - fine for /export (an
+// explicit, infrequent action that's already serving a file), but too slow
+// to do inline on every learn/delete/rename. Mutation handlers instead mark
+// the profile dirty and return immediately; loop() performs the actual write
+// a short debounce window later, off the request path, coalescing a burst of
+// rapid changes (e.g. several quick deletes) into a single flash write.
+bool profileDirty = false;
+unsigned long profileDirtyAt = 0;
+const unsigned long PROFILE_SAVE_DEBOUNCE_MS = 500;
+
+void markProfileDirty() {
+  profileDirty = true;
+  profileDirtyAt = millis();
+}
+
 // ---------- web handlers ----------
 String htmlEscape(const String &s) {
   String out;
@@ -629,7 +644,7 @@ void handleDefineMacro() {
     }
     macros[name] = list;
     updateScreen("Macro saved: " + name);
-    saveProfile();
+    markProfileDirty();
   }
   finishRequest();
 }
@@ -644,7 +659,7 @@ void handleLinkTrigger() {
     if (it != codeLibrary.end()) {
       triggerMap[it->second.hash] = macroName;
       updateScreen("Trigger linked: " + codeName);
-      saveProfile();
+      markProfileDirty();
     }
   }
   finishRequest();
@@ -664,7 +679,7 @@ void handleDeleteCode() {
         list.erase(std::remove(list.begin(), list.end(), name), list.end());
       }
       updateScreen("Deleted code: " + name);
-      saveProfile();
+      markProfileDirty();
     }
   }
   finishRequest();
@@ -685,7 +700,7 @@ void handleRenameCode() {
         }
       }
       updateScreen("Renamed: " + oldName + " -> " + newName);
-      saveProfile();
+      markProfileDirty();
     }
   }
   finishRequest();
@@ -701,7 +716,7 @@ void handleDeleteMacro() {
         else ++it;
       }
       updateScreen("Deleted macro: " + name);
-      saveProfile();
+      markProfileDirty();
     }
   }
   finishRequest();
@@ -720,7 +735,7 @@ void handleRenameMacro() {
         if (kv.second == oldName) kv.second = newName;
       }
       updateScreen("Renamed macro: " + oldName + " -> " + newName);
-      saveProfile();
+      markProfileDirty();
     }
   }
   finishRequest();
@@ -846,7 +861,7 @@ void loop() {
     if (learning) {
       codeLibrary[pendingLearnName] = code;
       updateScreen("Learned: " + pendingLearnName);
-      saveProfile();
+      markProfileDirty();
       flashLeds(CRGB::Green, 200);
       learning = false;
       pendingLearnName = "";
@@ -887,6 +902,13 @@ void loop() {
       fill_rainbow(leds, NUM_LEDS, hue++, 7);
       FastLED.show();
     }
+  }
+
+  // flush a dirty profile to flash after it's settled for a bit, off the
+  // request path - see markProfileDirty()
+  if (profileDirty && millis() - profileDirtyAt >= PROFILE_SAVE_DEBOUNCE_MS) {
+    profileDirty = false;
+    saveProfile();
   }
 
   // watch for heap fragmentation/leaks over long uptimes: getFreeHeap()
