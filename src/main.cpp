@@ -5,10 +5,14 @@
 #include <ESPmDNS.h>
 #include <IRremote.hpp>
 #include <FastLED.h>
+#include <LittleFS.h>
+#include <ArduinoJson.h>
 #include <map>
 #include <vector>
 #include <algorithm>
 #include "LGX_Config.h"
+
+#define PROFILE_PATH "/profile.json"
 
 #define RECV_PIN 5
 #define SEND_PIN 6
@@ -137,6 +141,106 @@ IRCode captureCurrent() {
     code.hash = code.hash * 31 + (code.data[i] / 50);
   }
   return code;
+}
+
+// ---------- persistence (LittleFS + JSON) ----------
+// Codes/macros/triggers are saved to flash after every mutation and reloaded
+// on boot, so the library survives a power cycle or re-flash.
+bool saveProfile() {
+  JsonDocument doc;
+
+  JsonObject codesObj = doc["codes"].to<JsonObject>();
+  for (auto &kv : codeLibrary) {
+    JsonObject codeObj = codesObj[kv.first].to<JsonObject>();
+    codeObj["hash"] = kv.second.hash;
+    JsonArray dataArr = codeObj["data"].to<JsonArray>();
+    for (uint16_t i = 0; i < kv.second.len; i++) {
+      dataArr.add(kv.second.data[i]);
+    }
+  }
+
+  JsonObject macrosObj = doc["macros"].to<JsonObject>();
+  for (auto &kv : macros) {
+    JsonArray listArr = macrosObj[kv.first].to<JsonArray>();
+    for (auto &codeName : kv.second) {
+      listArr.add(codeName);
+    }
+  }
+
+  JsonObject triggersObj = doc["triggers"].to<JsonObject>();
+  for (auto &kv : triggerMap) {
+    triggersObj[String(kv.first)] = kv.second;
+  }
+
+  File f = LittleFS.open(PROFILE_PATH, "w");
+  if (!f) {
+    Serial.println("saveProfile: failed to open " PROFILE_PATH " for writing");
+    return false;
+  }
+  size_t written = serializeJson(doc, f);
+  f.close();
+  Serial.printf("saveProfile: wrote %u bytes\n", (unsigned)written);
+  return written > 0;
+}
+
+bool loadProfile() {
+  if (!LittleFS.exists(PROFILE_PATH)) {
+    Serial.println("loadProfile: no saved profile yet");
+    return false;
+  }
+
+  File f = LittleFS.open(PROFILE_PATH, "r");
+  if (!f) {
+    Serial.println("loadProfile: failed to open " PROFILE_PATH " for reading");
+    return false;
+  }
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, f);
+  f.close();
+  if (err) {
+    Serial.print("loadProfile: parse failed: ");
+    Serial.println(err.c_str());
+    return false;
+  }
+
+  codeLibrary.clear();
+  macros.clear();
+  triggerMap.clear();
+
+  JsonObject codesObj = doc["codes"].as<JsonObject>();
+  for (JsonPair kv : codesObj) {
+    IRCode code;
+    JsonObject codeObj = kv.value().as<JsonObject>();
+    code.hash = codeObj["hash"].as<uint32_t>();
+    JsonArray dataArr = codeObj["data"].as<JsonArray>();
+    code.len = 0;
+    for (JsonVariant v : dataArr) {
+      if (code.len >= MAX_RAW_LEN) break;
+      code.data[code.len++] = v.as<uint16_t>();
+    }
+    codeLibrary[String(kv.key().c_str())] = code;
+  }
+
+  JsonObject macrosObj = doc["macros"].as<JsonObject>();
+  for (JsonPair kv : macrosObj) {
+    std::vector<String> list;
+    JsonArray listArr = kv.value().as<JsonArray>();
+    for (JsonVariant v : listArr) {
+      list.push_back(String(v.as<const char*>()));
+    }
+    macros[String(kv.key().c_str())] = list;
+  }
+
+  JsonObject triggersObj = doc["triggers"].as<JsonObject>();
+  for (JsonPair kv : triggersObj) {
+    uint32_t hash = strtoul(kv.key().c_str(), nullptr, 10);
+    triggerMap[hash] = String(kv.value().as<const char*>());
+  }
+
+  Serial.printf("loadProfile: loaded %u codes, %u macros, %u triggers\n",
+                (unsigned)codeLibrary.size(), (unsigned)macros.size(), (unsigned)triggerMap.size());
+  return true;
 }
 
 // ---------- web handlers ----------
@@ -285,6 +389,13 @@ static const char PAGE_HTML[] PROGMEM = R"HTML(<!doctype html>
   <button type='submit'>Save macro</button>
 </form>
 
+<h2>Backup</h2>
+<div class='item'>
+  <button type='button' onclick="window.location='/export'">Download backup</button>
+  <button type='button' class='secondary' onclick="document.getElementById('importFile').click()">Restore from file</button>
+  <input type='file' id='importFile' accept='application/json' style='display:none'>
+</div>
+
 <script>
 function api(path, params) {
   params.ajax = '1';
@@ -341,6 +452,21 @@ document.getElementById('macroForm').addEventListener('submit', function (e) {
   if (name && codes) mutate('/definemacro', {name: name, codes: codes});
   nameInput.value = '';
   codesInput.value = '';
+});
+
+document.getElementById('importFile').addEventListener('change', async function (e) {
+  const file = e.target.files[0];
+  e.target.value = '';
+  if (!file) return;
+  if (!confirm('This replaces every saved code and macro with the contents of ' + file.name + '. Continue?')) return;
+  const text = await file.text();
+  const res = await fetch('/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: text });
+  if (res.ok) {
+    alert('Profile imported.');
+    refresh();
+  } else {
+    alert('Import failed: ' + await res.text());
+  }
 });
 
 function render(state) {
@@ -459,6 +585,7 @@ void handleDefineMacro() {
     }
     macros[name] = list;
     updateScreen("Macro saved: " + name);
+    saveProfile();
   }
   finishRequest();
 }
@@ -473,6 +600,7 @@ void handleLinkTrigger() {
     if (it != codeLibrary.end()) {
       triggerMap[it->second.hash] = macroName;
       updateScreen("Trigger linked: " + codeName);
+      saveProfile();
     }
   }
   finishRequest();
@@ -492,6 +620,7 @@ void handleDeleteCode() {
         list.erase(std::remove(list.begin(), list.end(), name), list.end());
       }
       updateScreen("Deleted code: " + name);
+      saveProfile();
     }
   }
   finishRequest();
@@ -512,6 +641,7 @@ void handleRenameCode() {
         }
       }
       updateScreen("Renamed: " + oldName + " -> " + newName);
+      saveProfile();
     }
   }
   finishRequest();
@@ -527,6 +657,7 @@ void handleDeleteMacro() {
         else ++it;
       }
       updateScreen("Deleted macro: " + name);
+      saveProfile();
     }
   }
   finishRequest();
@@ -545,9 +676,49 @@ void handleRenameMacro() {
         if (kv.second == oldName) kv.second = newName;
       }
       updateScreen("Renamed macro: " + oldName + " -> " + newName);
+      saveProfile();
     }
   }
   finishRequest();
+}
+
+// downloads the current profile as a JSON file
+void handleExport() {
+  if (!saveProfile()) {
+    server.send(500, "text/plain", "Failed to prepare profile for export");
+    return;
+  }
+  File f = LittleFS.open(PROFILE_PATH, "r");
+  if (!f) {
+    server.send(500, "text/plain", "Failed to open profile for export");
+    return;
+  }
+  server.sendHeader("Content-Disposition", "attachment; filename=ir-profile.json");
+  server.streamFile(f, "application/json");
+  f.close();
+}
+
+// replaces the current profile with an uploaded JSON file's contents
+void handleImport() {
+  if (!server.hasArg("plain") || server.arg("plain").length() == 0) {
+    server.send(400, "text/plain", "No profile data in request body");
+    return;
+  }
+
+  File f = LittleFS.open(PROFILE_PATH, "w");
+  if (!f) {
+    server.send(500, "text/plain", "Failed to open profile for import");
+    return;
+  }
+  f.print(server.arg("plain"));
+  f.close();
+
+  if (!loadProfile()) {
+    server.send(400, "text/plain", "That file isn't a valid IR Controller profile");
+    return;
+  }
+  updateScreen("Profile imported");
+  server.send(200, "text/plain", "OK");
 }
 
 unsigned long lastLearnBtn = 0;
@@ -555,6 +726,12 @@ unsigned long lastLearnBtn = 0;
 void setup() {
   Serial.begin(115200);
   delay(500);
+
+  if (!LittleFS.begin(true)) {
+    Serial.println("LittleFS mount failed - codes/macros will not persist");
+  } else {
+    loadProfile();
+  }
 
   pinMode(LEARN_BTN_PIN, INPUT_PULLUP);
   pinMode(BLAST_BTN_PIN, INPUT_PULLUP);
@@ -598,6 +775,8 @@ void setup() {
   server.on("/renamecode", handleRenameCode);
   server.on("/deletemacro", handleDeleteMacro);
   server.on("/renamemacro", handleRenameMacro);
+  server.on("/export", HTTP_GET, handleExport);
+  server.on("/import", HTTP_POST, handleImport);
   server.begin();
 
   updateScreen("Ready");
@@ -623,6 +802,7 @@ void loop() {
     if (learning) {
       codeLibrary[pendingLearnName] = code;
       updateScreen("Learned: " + pendingLearnName);
+      saveProfile();
       flashLeds(CRGB::Green, 200);
       learning = false;
       pendingLearnName = "";
