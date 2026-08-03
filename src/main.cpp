@@ -18,6 +18,7 @@
 #define SEND_PIN 6
 #define LED_PIN  7
 #define NUM_LEDS 8
+#define NUM_SLOTS 8  // one per LED - the physical 2-button control scheme
 
 #define LEARN_BTN_PIN 19
 #define BLAST_BTN_PIN 20
@@ -45,7 +46,17 @@ std::map<uint32_t, String> triggerMap;              // hash of a learned code ->
 
 String pendingLearnName = "";  // if set, next captured signal gets saved under this name
 bool learning = false;
+int pendingLearnSlot = -1;     // if >= 0, the in-progress learn (above) is for this physical slot
 String lastStatus = "Booting...";
+
+// ---------- physical slots ----------
+// 8 virtual buttons, one per LED: button 1 fires whichever slot is
+// currently selected, button 2 short-press cycles slots, button 2 held
+// learns into the current slot. Each slot just points at a name in
+// codeLibrary, so it reuses the same learn/rename/delete machinery the web
+// app already has - the app can reassign a slot to any existing code too.
+String slotCodeName[NUM_SLOTS];  // "" = unassigned
+int currentSlot = 0;
 
 // ---------- IR sending ----------
 // Sent synchronously, on the same core/task as the receiver (setup()/loop()
@@ -193,6 +204,12 @@ bool saveProfile() {
     triggersObj[String(kv.first)] = kv.second;
   }
 
+  JsonArray slotsArr = doc["slots"].to<JsonArray>();
+  for (int i = 0; i < NUM_SLOTS; i++) {
+    slotsArr.add(slotCodeName[i]);
+  }
+  doc["currentSlot"] = currentSlot;
+
   File f = LittleFS.open(PROFILE_PATH, "w");
   if (!f) {
     Serial.println("saveProfile: failed to open " PROFILE_PATH " for writing");
@@ -258,6 +275,18 @@ bool loadProfile() {
     uint32_t hash = strtoul(kv.key().c_str(), nullptr, 10);
     triggerMap[hash] = String(kv.value().as<const char*>());
   }
+
+  for (int i = 0; i < NUM_SLOTS; i++) {
+    slotCodeName[i] = "";
+  }
+  JsonArray slotsArr = doc["slots"].as<JsonArray>();
+  int i = 0;
+  for (JsonVariant v : slotsArr) {
+    if (i >= NUM_SLOTS) break;
+    slotCodeName[i++] = String(v.as<const char*>());
+  }
+  currentSlot = doc["currentSlot"] | 0;
+  if (currentSlot < 0 || currentSlot >= NUM_SLOTS) currentSlot = 0;
 
   Serial.printf("loadProfile: loaded %u codes, %u macros, %u triggers\n",
                 (unsigned)codeLibrary.size(), (unsigned)macros.size(), (unsigned)triggerMap.size());
@@ -346,7 +375,7 @@ void handleApiState() {
   // do on nearly every line below, which is a steady source of heap
   // fragmentation on a device that stays powered on for a long time
   String json;
-  json.reserve(160 + 24 * (codeLibrary.size() + macros.size()));
+  json.reserve(260 + 24 * (codeLibrary.size() + macros.size()));
   json += "{";
   json += "\"status\":\"" + jsonEscape(lastStatus) + "\",";
   json += "\"learning\":" + String(learning ? "true" : "false") + ",";
@@ -367,6 +396,14 @@ void handleApiState() {
     if (!first) json += ",";
     first = false;
     json += "\"" + jsonEscape(kv.first) + "\"";
+  }
+  json += "],";
+
+  json += "\"currentSlot\":" + String(currentSlot) + ",";
+  json += "\"slots\":[";
+  for (int i = 0; i < NUM_SLOTS; i++) {
+    if (i > 0) json += ",";
+    json += "\"" + jsonEscape(slotCodeName[i]) + "\"";
   }
   json += "]}";
 
@@ -400,12 +437,17 @@ static const char PAGE_HTML[] PROGMEM = R"HTML(<!doctype html>
   button.danger { background:#a03030; }
   body.busy button { opacity:0.5; pointer-events:none; }
   input[type=text] { font-size:1rem; padding:10px; border-radius:8px; border:1px solid #555; background:#222; color:#eee; width:100%; }
+  select { font-size:0.95rem; padding:8px; border-radius:8px; border:1px solid #555; background:#222; color:#eee; flex:1 1 auto; min-width:0; }
+  .item.selected-slot { outline:2px solid #4cf4f4; }
   form.inline { display:flex; flex-direction:column; gap:8px; background:#1c1c1c; border-radius:10px; padding:12px; }
 </style>
 </head>
 <body>
 <h1>IR Controller</h1>
 <div id='statusBar'>Loading...</div>
+
+<h2>Physical buttons</h2>
+<div id='slots'></div>
 
 <h2>Saved codes</h2>
 <div id='codes'></div>
@@ -530,10 +572,39 @@ document.getElementById('importFile').addEventListener('change', async function 
   }
 });
 
+function assignSlot(slotIndex, name) { mutate('/assignslot', {slot: String(slotIndex), name: name}); }
+
 function render(state) {
   const bar = document.getElementById('statusBar');
   bar.textContent = state.status + (state.learning ? ' (' + state.pendingName + ')' : '');
   bar.className = state.learning ? 'learning' : '';
+
+  const slotsDiv = document.getElementById('slots');
+  slotsDiv.innerHTML = '';
+  state.slots.forEach(function (name, i) {
+    const row = document.createElement('div');
+    row.className = 'item' + (i === state.currentSlot ? ' selected-slot' : '');
+    const label = document.createElement('span');
+    label.className = 'name';
+    label.textContent = 'Button ' + (i + 1);
+    row.appendChild(label);
+    const select = document.createElement('select');
+    const noneOpt = document.createElement('option');
+    noneOpt.value = '';
+    noneOpt.textContent = '(unassigned)';
+    if (!name) noneOpt.selected = true;
+    select.appendChild(noneOpt);
+    state.codes.forEach(function (codeName) {
+      const opt = document.createElement('option');
+      opt.value = codeName;
+      opt.textContent = codeName;
+      if (codeName === name) opt.selected = true;
+      select.appendChild(opt);
+    });
+    select.addEventListener('change', function () { assignSlot(i, select.value); });
+    row.appendChild(select);
+    slotsDiv.appendChild(row);
+  });
 
   const codesDiv = document.getElementById('codes');
   codesDiv.innerHTML = '';
@@ -606,6 +677,7 @@ void handleLearn() {
       return;
     }
     pendingLearnName = name;
+    pendingLearnSlot = -1;  // this learn came from the web app, not a physical slot
     learning = true;
     updateScreen("Point remote & press...");
     flashLeds(CRGB::Yellow, 150);
@@ -684,6 +756,9 @@ void handleDeleteCode() {
         auto &list = kv.second;
         list.erase(std::remove(list.begin(), list.end(), name), list.end());
       }
+      for (int i = 0; i < NUM_SLOTS; i++) {
+        if (slotCodeName[i] == name) slotCodeName[i] = "";
+      }
       updateScreen("Deleted code: " + name);
       markProfileDirty();
     }
@@ -704,6 +779,9 @@ void handleRenameCode() {
         for (auto &codeName : kv.second) {
           if (codeName == oldName) codeName = newName;
         }
+      }
+      for (int i = 0; i < NUM_SLOTS; i++) {
+        if (slotCodeName[i] == oldName) slotCodeName[i] = newName;
       }
       updateScreen("Renamed: " + oldName + " -> " + newName);
       markProfileDirty();
@@ -786,7 +864,107 @@ void handleImport() {
   server.send(200, "text/plain", "OK");
 }
 
-unsigned long lastLearnBtn = 0;
+// /assignslot?slot=0&name=Button%201 - name="" (or omitted) clears the slot.
+// Lets the web app repoint a physical slot at any existing code without
+// needing the physical buttons at all.
+void handleAssignSlot() {
+  if (!server.hasArg("slot")) {
+    server.send(400, "text/plain", "Missing slot");
+    return;
+  }
+  int slot = server.arg("slot").toInt();
+  if (slot < 0 || slot >= NUM_SLOTS) {
+    server.send(400, "text/plain", "Slot out of range");
+    return;
+  }
+  String name = server.hasArg("name") ? server.arg("name") : "";
+  if (name.length() > 0 && !codeLibrary.count(name)) {
+    server.send(400, "text/plain", "No such code");
+    return;
+  }
+  slotCodeName[slot] = name;
+  updateScreen("Slot " + String(slot + 1) + (name.length() ? (" -> " + name) : " cleared"));
+  markProfileDirty();
+  finishRequest();
+}
+
+// ---------- physical control: 2 buttons + 8 LEDs as slot indicators ----------
+// Button 1 fires whichever slot is selected. Button 2 short-press cycles
+// slots; held past LONG_PRESS_MS it learns into the current slot instead,
+// overwriting whatever was there - no confirmation, since there's no screen
+// prompt possible from two buttons alone (the web app's overwrite confirm
+// is for the web flow, not this one).
+const unsigned long LONG_PRESS_MS = 600;
+
+void startSlotLearn(int slot) {
+  String name = slotCodeName[slot];
+  if (name.length() == 0) {
+    name = "Button " + String(slot + 1);
+  }
+  pendingLearnName = name;
+  pendingLearnSlot = slot;
+  learning = true;
+  updateScreen("Learning slot " + String(slot + 1) + ": " + name);
+  flashLeds(CRGB::Yellow, 150);
+}
+
+// Idle LED display: each LED mirrors one slot - bright for the selected
+// slot (blinking if a learn is pending on it), dim green if assigned, off
+// if empty. Replaces the old idle rainbow now that the LEDs mean something.
+void updateSlotLeds() {
+  for (int i = 0; i < NUM_SLOTS && i < NUM_LEDS; i++) {
+    bool selected = (i == currentSlot);
+    bool assigned = slotCodeName[i].length() > 0;
+    CRGB color;
+    if (selected && learning) {
+      bool on = (millis() / 300) % 2 == 0;
+      color = on ? CRGB(80, 60, 0) : CRGB::Black;
+    } else if (selected) {
+      color = CRGB(0, 90, 100);
+    } else if (assigned) {
+      color = CRGB(0, 25, 0);
+    } else {
+      color = CRGB::Black;
+    }
+    leds[i] = color;
+  }
+  FastLED.show();
+}
+
+unsigned long lastBlastBtn = 0;
+bool learnBtnDown = false;
+unsigned long learnBtnPressedAt = 0;
+bool learnBtnLongFired = false;
+
+void handlePhysicalButtons() {
+  if (digitalRead(BLAST_BTN_PIN) == LOW && millis() - lastBlastBtn > 300) {
+    lastBlastBtn = millis();
+    if (slotCodeName[currentSlot].length() > 0) {
+      queueCodeSend(slotCodeName[currentSlot]);
+    } else {
+      updateScreen("Slot " + String(currentSlot + 1) + " is empty");
+      flashLeds(CRGB::Orange, 150);
+    }
+  }
+
+  bool learnBtnIsDown = (digitalRead(LEARN_BTN_PIN) == LOW);
+  if (learnBtnIsDown && !learnBtnDown) {
+    learnBtnDown = true;
+    learnBtnPressedAt = millis();
+    learnBtnLongFired = false;
+  } else if (learnBtnIsDown && learnBtnDown && !learnBtnLongFired &&
+             millis() - learnBtnPressedAt >= LONG_PRESS_MS) {
+    learnBtnLongFired = true;
+    startSlotLearn(currentSlot);
+  } else if (!learnBtnIsDown && learnBtnDown) {
+    learnBtnDown = false;
+    if (!learnBtnLongFired) {
+      currentSlot = (currentSlot + 1) % NUM_SLOTS;
+      updateScreen("Slot " + String(currentSlot + 1) + " selected");
+      markProfileDirty();
+    }
+  }
+}
 
 void setup() {
   Serial.begin(115200);
@@ -842,6 +1020,7 @@ void setup() {
   server.on("/renamemacro", handleRenameMacro);
   server.on("/export", HTTP_GET, handleExport);
   server.on("/import", HTTP_POST, handleImport);
+  server.on("/assignslot", handleAssignSlot);
   server.begin();
 
   updateScreen("Ready");
@@ -850,13 +1029,7 @@ void setup() {
 void loop() {
   server.handleClient();
 
-  if (digitalRead(LEARN_BTN_PIN) == LOW && millis() - lastLearnBtn > 300) {
-    lastLearnBtn = millis();
-    pendingLearnName = "button_code_" + String(millis());
-    learning = true;
-    updateScreen("Point remote & press...");
-    flashLeds(CRGB::Yellow, 150);
-  }
+  handlePhysicalButtons();
 
   if (!suppressReceive && IrReceiver.decode()) {
     Serial.print("IR event: ");
@@ -866,6 +1039,10 @@ void loop() {
 
     if (learning) {
       codeLibrary[pendingLearnName] = code;
+      if (pendingLearnSlot >= 0) {
+        slotCodeName[pendingLearnSlot] = pendingLearnName;
+        pendingLearnSlot = -1;
+      }
       updateScreen("Learned: " + pendingLearnName);
       markProfileDirty();
       flashLeds(CRGB::Green, 200);
@@ -902,11 +1079,9 @@ void loop() {
     }
   } else {
     static unsigned long lastLedUpdate = 0;
-    if (!learning && millis() - lastLedUpdate > 30) {
+    if (millis() - lastLedUpdate > 30) {
       lastLedUpdate = millis();
-      static uint8_t hue = 0;
-      fill_rainbow(leds, NUM_LEDS, hue++, 7);
-      FastLED.show();
+      updateSlotLeds();
     }
   }
 
