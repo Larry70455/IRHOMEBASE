@@ -13,25 +13,53 @@
 #include <algorithm>
 #include <utility>
 #include <ctype.h>
-#include "LGX_Config.h"
+
+// Board selection is set at the build-system level: platformio.ini's
+// [env:cyd] passes -D BOARD_CYD, [env:esp32-s3-devkitm-1] doesn't. Every
+// hardware difference between the two boards branches off this one flag
+// (or HAS_WS2812 below, which follows from it) rather than a scattered set
+// of ad-hoc checks.
+#ifdef BOARD_CYD
+  #include "LGX_Config_CYD.h"
+#else
+  #include "LGX_Config.h"
+#endif
 
 #define PROFILE_PATH "/profile.json"
 
-#define RECV_PIN 5
-#define SEND_PIN 6
-#define LED_PIN  7
-#define NUM_LEDS 8
-#define NUM_SLOTS 8  // one per LED - the physical 2-button control scheme
+// CYD has no WS2812 strip and no dedicated learn/blast buttons - the
+// touchscreen replaces both (see the BOARD_CYD screen-manager section
+// further down). IR receive/transmit run directly off GPIO22/GPIO27,
+// broken out on CYD's CN1 header and confirmed free/unclaimed by the
+// display, touch, RGB LED, speaker, SD card, or light sensor circuitry.
+#ifdef BOARD_CYD
+  #define RECV_PIN 22
+  #define SEND_PIN 27
+  #define HAS_WS2812 0
+#else
+  #define RECV_PIN 5
+  #define SEND_PIN 6
+  #define LED_PIN  7
+  #define NUM_LEDS 8
+  #define HAS_WS2812 1
+  #define LEARN_BTN_PIN 19
+  #define BLAST_BTN_PIN 20
+#endif
 
-#define LEARN_BTN_PIN 19
-#define BLAST_BTN_PIN 20
+// One slot per LED on the original board; on CYD there's no LED strip or
+// physical slot-select button, but the slot data/handlers/web tab still
+// compile and stay reachable over the web either way (see plan notes) - so
+// this stays unconditional rather than following HAS_WS2812.
+#define NUM_SLOTS 8
 
 const char* ssid = "Home_2g";
 const char* password = "604428LS";
 const char* hostname = "IR";
 
 LGFX tft;
+#if HAS_WS2812
 CRGB leds[NUM_LEDS];
+#endif
 WebServer server(80);
 
 // ---------- IR code storage ----------
@@ -418,6 +446,16 @@ void drawSlotGrid(int gridX, int gridY, int cellW, int cellH, int gap) {
   tft.setTextDatum(textdatum_t::top_left);
 }
 
+// The three CYD functions below are defined in the CYD screen-manager
+// section further down (just above setup()), but called from here and from
+// flashLeds()/loop(), all defined earlier in the file - forward declared
+// so those call sites compile regardless of definition order.
+#ifdef BOARD_CYD
+void cydDrawStatusBar(const String &status);
+void cydTintBanner(CRGB color, int ms);
+void cydCheckBannerTintRevert();
+#endif
+
 void updateScreen(String status) {
   lastStatus = status;
   lastActivityAt = millis();
@@ -426,6 +464,13 @@ void updateScreen(String status) {
     tft.setBrightness(SCREEN_BRIGHTNESS);
   }
 
+#ifdef BOARD_CYD
+  // CYD's screen is a Home/Learn touch GUI, not this board's fixed status
+  // layout - only the persistent banner strip (shared across every CYD
+  // screen) needs repainting here. A full-screen redraw on every status
+  // change would otherwise wipe out whichever screen/tap-zones are showing.
+  cydDrawStatusBar(status);
+#else
   tft.startWrite();
   tft.fillScreen(TFT_BLACK);
 
@@ -460,26 +505,42 @@ void updateScreen(String status) {
   tft.drawString(truncateToWidth(slotLine, SCREEN_W - 20), 10, 272);
 
   tft.endWrite();
+#endif
 }
 
 // Sets the LEDs immediately and returns without blocking; loop() reverts
 // them (to the idle rainbow, or just off while learning) once the requested
 // duration has elapsed. Previously this used delay(), which blocked the web
 // server/receiver for the flash's full duration on nearly every action.
+// CYD has no LEDs - flashLeds() itself branches below so every existing
+// call site (learn/blast/assign/lookup/etc, 15+ of them) stays unchanged;
+// CYD just tints the on-screen status banner instead of a physical LED,
+// with the same non-blocking "set now, revert later" shape (see
+// cydTintBanner() in the CYD screen-manager section further down).
+#if HAS_WS2812
 bool ledFlashActive = false;
 unsigned long ledFlashUntil = 0;
+#endif
 
 void flashLeds(CRGB color, int ms) {
+#if HAS_WS2812
   fill_solid(leds, NUM_LEDS, color);
   FastLED.show();
   ledFlashActive = true;
   ledFlashUntil = millis() + ms;
+#else
+  cydTintBanner(color, ms);
+#endif
 }
 
 // Visual "signal going out" cue: lights one LED at a time, 1 through 8, in
 // place of the old solid flash after a send. This plays after the actual
 // (blocking) transmission has already finished - the real send is too fast
-// to visualize live - but reads as "there it goes" immediately after.
+// to visualize live - but reads as "there it goes" immediately after. CYD
+// has no LED strip to animate this way - its call site (in loop(), where a
+// queued send completes) falls back to a plain flashLeds() banner tint
+// instead, which already has a CYD equivalent above.
+#if HAS_WS2812
 bool ledWaveActive = false;
 unsigned long ledWaveStartedAt = 0;
 const unsigned long LED_WAVE_STEP_MS = 60;
@@ -489,6 +550,7 @@ void startTransmitWave() {
   ledWaveActive = true;
   ledWaveStartedAt = millis();
 }
+#endif
 
 // ---------- capture helper ----------
 IRCode captureCurrent() {
@@ -1818,6 +1880,14 @@ void handleRoot() {
   server.send_P(200, "text/html", PAGE_HTML);
 }
 
+#ifdef BOARD_CYD
+void cydShowLearnScreen();  // defined in the CYD screen-manager section further down
+#endif
+
+// Also the entry point CYD's on-screen "Learn New" tap uses (see
+// cydHandleTouch()) - it sets these same globals directly rather than
+// calling this handler, since there's no HTTP request to satisfy there,
+// but the effect is identical either way.
 void handleLearn() {
   if (server.hasArg("name")) {
     String name = server.arg("name");
@@ -1837,6 +1907,11 @@ void handleLearn() {
     learningStartedAt = millis();
     updateScreen("Point remote & press...");
     flashLeds(CRGB::Yellow, 150);
+#ifdef BOARD_CYD
+    // so a learn started from the web is also reflected on the touchscreen
+    // if someone's looking at it, not just via the status banner text
+    cydShowLearnScreen();
+#endif
   }
   finishRequest();
 }
@@ -2270,6 +2345,10 @@ void handleSaveLookupCode() {
 }
 
 // ---------- physical control: 2 buttons + 8 LEDs as slot indicators ----------
+// CYD has neither dedicated buttons nor an LED strip - this entire section
+// is specific to the original board (see BOARD_CYD's touch-screen Home/
+// Learn screens further down for its equivalent).
+#ifndef BOARD_CYD
 // Button 1 fires whichever slot is selected. Button 2 short-press cycles
 // slots; held past LONG_PRESS_MS it learns into the current slot instead,
 // overwriting whatever was there - no confirmation, since there's no screen
@@ -2289,6 +2368,7 @@ void startSlotLearn(int slot) {
   updateScreen("Learning slot " + String(slot + 1) + ": " + name);
   flashLeds(CRGB::Yellow, 150);
 }
+#endif
 
 // Idle LED display: each LED mirrors one slot. Three states so you can
 // actually tell a slot is set without cycling to it: accentColor for the
@@ -2299,7 +2379,10 @@ void startSlotLearn(int slot) {
 // moment it starts (see startSlotLearn()), and if currentSlot were free to
 // drift away from that slot in the meantime, the blink would follow the
 // wrong LED - showing you were learning into a slot you weren't. Replaces
-// the old idle rainbow now that the LEDs mean something.
+// the old idle rainbow now that the LEDs mean something. No CYD equivalent
+// needed: CYD has no physical slot-select button/LED strip at all (slots
+// are web-only on that board - see the plan notes).
+#if HAS_WS2812
 void updateSlotLeds() {
   for (int i = 0; i < NUM_SLOTS && i < NUM_LEDS; i++) {
     CRGB color;
@@ -2317,6 +2400,7 @@ void updateSlotLeds() {
   }
   FastLED.show();
 }
+#endif
 
 // Debounces a pulled-up button pin: a raw reading only becomes "the truth"
 // once it's held steady for DEBOUNCE_MS. Without this, mechanical contact
@@ -2324,6 +2408,8 @@ void updateSlotLeds() {
 // as several presses and releases for what was physically one press - the
 // likely cause of "weird stuff happening" on button 2 in particular, since
 // its state machine tracks edges (press/release/hold), not just a level.
+// CYD equivalent: touch polling debounce in loop() (see BOARD_CYD section).
+#ifndef BOARD_CYD
 const unsigned long DEBOUNCE_MS = 25;
 
 bool debounceButton(int pin, int &lastRaw, unsigned long &lastChangeAt, bool &stable) {
@@ -2392,6 +2478,7 @@ void handlePhysicalButtons() {
     }
   }
 }
+#endif  // !BOARD_CYD (physical control section)
 
 // ---------- WiFi reconnect watchdog ----------
 // WiFi.begin() only kicks off a connection attempt - it doesn't block
@@ -2464,6 +2551,289 @@ void initWatchdog() {
   esp_task_wdt_add(NULL);
 }
 
+// ---------- CYD touch GUI: screen manager ----------
+// Scope is deliberately narrow (Home + Learn only, per explicit user
+// decision) - Physical slots, IRDB Lookup, Colors, and Backup stay
+// web-only on this board, reachable through the same WebServer that's
+// still fully active here (see setup() below).
+//
+// No UI framework in use (raw LGFX calls only, same as the other board) -
+// each screen does a full redraw into a fixed-size tap-zone list, and
+// cydHandleTouch() hit-tests a touch point against whichever list is
+// currently active. Reuses the same drawing helpers already written for
+// the other board's screen (drawIcon(), contrastTextColor(),
+// truncateToWidth()) rather than duplicating them.
+#ifdef BOARD_CYD
+
+const int CYD_BANNER_H = 50;  // persistent status strip, shared across every CYD screen
+
+enum CydScreen { CYD_HOME, CYD_LEARN };
+CydScreen currentCydScreen = CYD_HOME;
+
+struct TapZone {
+  int x, y, w, h;
+  int action;  // >=0 on Home = index into remoteButtons; else one of the CYD_ACTION_* codes below
+};
+const int MAX_TAP_ZONES = 24;
+TapZone cydZones[MAX_TAP_ZONES];
+int cydZoneCount = 0;
+
+void cydAddZone(int x, int y, int w, int h, int action) {
+  if (cydZoneCount >= MAX_TAP_ZONES) return;
+  cydZones[cydZoneCount++] = {x, y, w, h, action};
+}
+
+const int CYD_ACTION_LEARN_NEW = -2;
+const int CYD_ACTION_CANCEL_LEARN = -3;
+const int CYD_ACTION_PAGE_PREV = -4;
+const int CYD_ACTION_PAGE_NEXT = -5;
+
+int cydHomePage = 0;
+const int CYD_COLS_MAX = 4;      // wider remoteColumns settings get clamped here for legibility - the full column count still applies on the web Remote tab
+const int CYD_ROWS_PER_PAGE = 3;
+
+// Draws just the persistent banner strip - called on every updateScreen(),
+// so it stays cheap (partial redraw) rather than touching the rest of
+// whichever screen is currently showing underneath it.
+void cydDrawStatusBar(const String &status) {
+  uint16_t accent565 = tft.color565(accentColor.r, accentColor.g, accentColor.b);
+  tft.fillRect(0, 0, SCREEN_W, CYD_BANNER_H, accent565);
+  tft.setFont(&fonts::FreeSansBold9pt7b);
+  tft.setTextDatum(textdatum_t::middle_center);
+  tft.setTextColor(contrastTextColor(accentColor), accent565);
+  tft.drawString(truncateToWidth(status, SCREEN_W - 20), SCREEN_W / 2, CYD_BANNER_H / 2);
+  tft.setTextDatum(textdatum_t::top_left);
+}
+
+// CYD's flashLeds() equivalent: tints the banner instead of an LED, with
+// the same non-blocking "set now, revert later" shape as ledFlashActive on
+// the other board (see cydCheckBannerTintRevert(), called from loop()).
+bool cydBannerTintActive = false;
+unsigned long cydBannerTintUntil = 0;
+
+void cydTintBanner(CRGB color, int ms) {
+  uint16_t c565 = tft.color565(color.r, color.g, color.b);
+  tft.fillRect(0, 0, SCREEN_W, CYD_BANNER_H, c565);
+  tft.setFont(&fonts::FreeSansBold9pt7b);
+  tft.setTextDatum(textdatum_t::middle_center);
+  tft.setTextColor(contrastTextColor(color), c565);
+  tft.drawString(truncateToWidth(lastStatus, SCREEN_W - 20), SCREEN_W / 2, CYD_BANNER_H / 2);
+  tft.setTextDatum(textdatum_t::top_left);
+  cydBannerTintActive = true;
+  cydBannerTintUntil = millis() + ms;
+}
+
+void cydCheckBannerTintRevert() {
+  if (cydBannerTintActive && millis() >= cydBannerTintUntil) {
+    cydBannerTintActive = false;
+    cydDrawStatusBar(lastStatus);
+  }
+}
+
+void cydShowScreen(CydScreen s);  // forward-referenced by cydHandleTouch() below
+
+// Home: the virtual Remote grid (remoteButtons/remoteColumns - same data
+// the web Remote tab edits), tap a tile to fire it, paged if more tiles
+// exist than fit. Spacers render as a real gap (no tile, no tap zone),
+// matching how the web Remote builder treats them.
+void cydDrawHome() {
+  cydZoneCount = 0;
+  tft.startWrite();
+  tft.fillScreen(TFT_BLACK);
+  cydDrawStatusBar(lastStatus);
+
+  int cols = remoteColumns;
+  if (cols < 1) cols = 1;
+  if (cols > CYD_COLS_MAX) cols = CYD_COLS_MAX;
+  int perPage = cols * CYD_ROWS_PER_PAGE;
+  int totalPages = max(1, (int)((remoteButtons.size() + perPage - 1) / perPage));
+  if (cydHomePage >= totalPages) cydHomePage = totalPages - 1;
+  if (cydHomePage < 0) cydHomePage = 0;
+
+  int gridTop = CYD_BANNER_H + 8;
+  int footerH = 54;
+  int gridH = SCREEN_H - gridTop - footerH - 8;
+  int gap = 6;
+  int cellW = (SCREEN_W - 16 - (cols - 1) * gap) / cols;
+  int cellH = (gridH - (CYD_ROWS_PER_PAGE - 1) * gap) / CYD_ROWS_PER_PAGE;
+
+  int start = cydHomePage * perPage;
+  int end = min((int)remoteButtons.size(), start + perPage);
+  for (int i = start; i < end; i++) {
+    int slot = i - start;
+    int col = slot % cols;
+    int row = slot / cols;
+    int x = 8 + col * (cellW + gap);
+    int y = gridTop + row * (cellH + gap);
+    RemoteButton &b = remoteButtons[i];
+    if (b.spacer) continue;  // invisible placeholder - real gap, no tile
+
+    uint16_t bg565 = tft.color565(b.color.r, b.color.g, b.color.b);
+    uint16_t textColor = contrastTextColor(b.color);
+    tft.fillRoundRect(x, y, cellW, cellH, 8, bg565);
+    if (b.icon != ICON_NONE) {
+      drawIcon(b.icon, x, y, cellW, cellH, textColor);
+    } else {
+      tft.setFont(&fonts::FreeSansBold9pt7b);
+      tft.setTextDatum(textdatum_t::middle_center);
+      tft.setTextColor(textColor, bg565);
+      String label = b.name.length() ? b.name : b.codeName;
+      tft.drawString(truncateToWidth(label, cellW - 8), x + cellW / 2, y + cellH / 2);
+      tft.setTextDatum(textdatum_t::top_left);
+    }
+    cydAddZone(x, y, cellW, cellH, i);
+  }
+
+  if (remoteButtons.size() == 0) {
+    tft.setFont(&fonts::FreeSans9pt7b);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextDatum(textdatum_t::middle_center);
+    tft.drawString("No remote buttons yet -", SCREEN_W / 2, SCREEN_H / 2 - 12);
+    tft.drawString("add some from the web app.", SCREEN_W / 2, SCREEN_H / 2 + 12);
+    tft.setTextDatum(textdatum_t::top_left);
+  }
+
+  // footer: paging (only if needed) + Learn New
+  int footerY = SCREEN_H - footerH;
+  tft.setFont(&fonts::FreeSansBold9pt7b);
+  tft.setTextDatum(textdatum_t::middle_center);
+  int learnX = 8;
+  int learnW = SCREEN_W - 16;
+  if (totalPages > 1) {
+    int navW = 60;
+    tft.fillRoundRect(8, footerY, navW, footerH - 8, 8, TFT_DARKGREY);
+    tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
+    tft.drawString("<", 8 + navW / 2, footerY + (footerH - 8) / 2);
+    cydAddZone(8, footerY, navW, footerH - 8, CYD_ACTION_PAGE_PREV);
+
+    tft.fillRoundRect(SCREEN_W - 8 - navW, footerY, navW, footerH - 8, 8, TFT_DARKGREY);
+    tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
+    tft.drawString(">", SCREEN_W - 8 - navW / 2, footerY + (footerH - 8) / 2);
+    cydAddZone(SCREEN_W - 8 - navW, footerY, navW, footerH - 8, CYD_ACTION_PAGE_NEXT);
+
+    learnX = 8 + navW + 8;
+    learnW = SCREEN_W - 16 - 2 * (navW + 8);
+  }
+  uint16_t accent565 = tft.color565(accentColor.r, accentColor.g, accentColor.b);
+  tft.fillRoundRect(learnX, footerY, learnW, footerH - 8, 8, accent565);
+  tft.setTextColor(contrastTextColor(accentColor), accent565);
+  tft.drawString("Learn New", learnX + learnW / 2, footerY + (footerH - 8) / 2);
+  cydAddZone(learnX, footerY, learnW, footerH - 8, CYD_ACTION_LEARN_NEW);
+  tft.setTextDatum(textdatum_t::top_left);
+
+  tft.endWrite();
+}
+
+// Learn: mirrors the web app's /learn flow exactly (same pendingLearnName/
+// pendingLearnSlot/learning globals, same shared loop() IR-decode
+// learn-complete branch) - just triggered by a tap instead of a request.
+void cydDrawLearn() {
+  cydZoneCount = 0;
+  tft.startWrite();
+  tft.fillScreen(TFT_BLACK);
+  cydDrawStatusBar(lastStatus);
+
+  tft.setFont(&fonts::FreeSansBold12pt7b);
+  tft.setTextDatum(textdatum_t::middle_center);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("Point remote &", SCREEN_W / 2, SCREEN_H / 2 - 40);
+  tft.drawString("press a button", SCREEN_W / 2, SCREEN_H / 2 - 10);
+  tft.setFont(&fonts::FreeSans9pt7b);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("Waiting for signal...", SCREEN_W / 2, SCREEN_H / 2 + 30);
+  tft.setTextDatum(textdatum_t::top_left);
+
+  int footerY = SCREEN_H - 54;
+  tft.fillRoundRect(8, footerY, SCREEN_W - 16, 46, 8, TFT_MAROON);
+  tft.setFont(&fonts::FreeSansBold9pt7b);
+  tft.setTextDatum(textdatum_t::middle_center);
+  tft.setTextColor(TFT_WHITE, TFT_MAROON);
+  tft.drawString("Cancel", SCREEN_W / 2, footerY + 23);
+  tft.setTextDatum(textdatum_t::top_left);
+  cydAddZone(8, footerY, SCREEN_W - 16, 46, CYD_ACTION_CANCEL_LEARN);
+
+  tft.endWrite();
+}
+
+void cydShowScreen(CydScreen s) {
+  currentCydScreen = s;
+  if (s == CYD_HOME) {
+    cydHomePage = 0;
+    cydDrawHome();
+  } else {
+    cydDrawLearn();
+  }
+}
+
+// Thin wrapper so handleLearn() (defined earlier in the file, before
+// CydScreen exists) can trigger this without needing the enum visible at
+// its forward-declaration point.
+void cydShowLearnScreen() { cydShowScreen(CYD_LEARN); }
+
+// Dispatches a touch point to whichever action zone (if any) it lands in
+// on the currently active screen. Reuses the exact same shared triggers
+// the web app uses - queueCodeSend() for firing a code, the same
+// pendingLearnName/learning/learningStartedAt setup handleLearn() uses to
+// start a learn - so there's no forked logic, just a different trigger.
+void cydHandleTouch(int x, int y) {
+  for (int i = 0; i < cydZoneCount; i++) {
+    TapZone &z = cydZones[i];
+    if (x < z.x || x >= z.x + z.w || y < z.y || y >= z.y + z.h) continue;
+
+    int action = z.action;
+    if (currentCydScreen == CYD_HOME) {
+      if (action == CYD_ACTION_LEARN_NEW) {
+        pendingLearnName = "button_code_" + String(millis());
+        pendingLearnSlot = -1;
+        learning = true;
+        learningStartedAt = millis();
+        updateScreen("Point remote & press...");
+        flashLeds(CRGB::Yellow, 150);
+        cydShowScreen(CYD_LEARN);
+      } else if (action == CYD_ACTION_PAGE_PREV) {
+        cydHomePage--;
+        cydDrawHome();
+      } else if (action == CYD_ACTION_PAGE_NEXT) {
+        cydHomePage++;
+        cydDrawHome();
+      } else if (action >= 0 && action < (int)remoteButtons.size()) {
+        const RemoteButton &b = remoteButtons[action];
+        if (b.codeName.length() > 0) {
+          queueCodeSend(b.codeName);
+        } else {
+          updateScreen("No code assigned");
+          flashLeds(CRGB::Orange, 150);
+        }
+      }
+    } else if (currentCydScreen == CYD_LEARN) {
+      if (action == CYD_ACTION_CANCEL_LEARN) {
+        learning = false;
+        pendingLearnName = "";
+        pendingLearnSlot = -1;
+        updateScreen("Learn cancelled");
+        cydShowScreen(CYD_HOME);
+      }
+    }
+    return;  // stop at the first matching zone
+  }
+}
+
+// Polled from loop(), non-blocking, debounced the same ~300ms as the other
+// board's physical buttons so one physical tap doesn't register twice.
+unsigned long lastCydTouchAt = 0;
+const unsigned long CYD_TOUCH_DEBOUNCE_MS = 300;
+
+void cydHandleTouchPoll() {
+  if (millis() - lastCydTouchAt < CYD_TOUCH_DEBOUNCE_MS) return;
+  int32_t tx, ty;
+  if (tft.getTouch(&tx, &ty)) {
+    lastCydTouchAt = millis();
+    cydHandleTouch((int)tx, (int)ty);
+  }
+}
+
+#endif  // BOARD_CYD
+
 void setup() {
   Serial.begin(115200);
   delay(500);
@@ -2485,21 +2855,36 @@ void setup() {
     loadProfile();
   }
 
+#ifndef BOARD_CYD
   pinMode(LEARN_BTN_PIN, INPUT_PULLUP);
   pinMode(BLAST_BTN_PIN, INPUT_PULLUP);
+#endif
 
   tft.init();
   tft.setRotation(0);
   tft.setTextWrap(false);  // all text is measured/truncated manually - never let the library wrap
   tft.setBrightness(SCREEN_BRIGHTNESS);
   tft.fillScreen(TFT_BLACK);
+
+#ifdef BOARD_CYD
+  // One-time interactive touch calibration (crosshairs, tap to confirm) -
+  // not persisted to flash, so this runs fresh every boot. Uses LGFX's
+  // built-in helper rather than a hand-rolled 2-point tap UI. Blocking, but
+  // only here at boot - same as the WiFi-connect-retry loop below - loop()
+  // itself stays fully non-blocking.
+  uint16_t cydCalibData[8];
+  tft.calibrateTouch(cydCalibData, TFT_WHITE, TFT_BLACK, 20);
+#endif
+
   updateScreen("Booting...");
 
   IrReceiver.begin(RECV_PIN, DISABLE_LED_FEEDBACK);
   IrSender.begin(SEND_PIN);
 
+#if HAS_WS2812
   FastLED.addLeds<WS2812, LED_PIN, GRB>(leds, NUM_LEDS);
   FastLED.setBrightness(50);
+#endif
 
   WiFi.begin(ssid, password);
   updateScreen("Connecting WiFi...");
@@ -2543,6 +2928,9 @@ void setup() {
   server.begin();
 
   updateScreen("Ready");
+#ifdef BOARD_CYD
+  cydShowScreen(CYD_HOME);
+#endif
 }
 
 void loop() {
@@ -2551,7 +2939,11 @@ void loop() {
   handleWifiWatchdog();
   handleMqtt();
 
+#ifndef BOARD_CYD
   handlePhysicalButtons();
+#else
+  cydHandleTouchPoll();
+#endif
 
   if (!suppressReceive && IrReceiver.decode()) {
     Serial.print("IR event: ");
@@ -2575,6 +2967,9 @@ void loop() {
       flashLeds(CRGB::Green, 200);
       learning = false;
       pendingLearnName = "";
+#ifdef BOARD_CYD
+      if (currentCydScreen == CYD_LEARN) cydShowScreen(CYD_HOME);
+#endif
     } else {
       // not learning - just note that a signal came in
       updateScreen("Signal seen");
@@ -2598,7 +2993,11 @@ void loop() {
     pendingSends.erase(pendingSends.begin());
     sendCodeByName(name);
     updateScreen("Blasted: " + name);
+#if HAS_WS2812
     startTransmitWave();
+#else
+    flashLeds(CRGB::Blue, 150);  // no LED strip to wave - banner tint instead
+#endif
   }
 
   // give up on a learn nobody ever finished (forgot to press the remote,
@@ -2610,8 +3009,12 @@ void loop() {
     learning = false;
     pendingLearnName = "";
     pendingLearnSlot = -1;
+#ifdef BOARD_CYD
+    if (currentCydScreen == CYD_LEARN) cydShowScreen(CYD_HOME);
+#endif
   }
 
+#if HAS_WS2812
   if (ledWaveActive) {
     unsigned long elapsed = millis() - ledWaveStartedAt;
     int step = elapsed / LED_WAVE_STEP_MS;
@@ -2633,6 +3036,9 @@ void loop() {
       updateSlotLeds();
     }
   }
+#else
+  cydCheckBannerTintRevert();  // non-blocking counterpart to cydTintBanner() - see CYD screen-manager section
+#endif
 
   // flush a dirty profile to flash after it's settled for a bit, off the
   // request path - see markProfileDirty()
