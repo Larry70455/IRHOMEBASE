@@ -2652,6 +2652,36 @@ void cydApplyRotation() {
   tft.setRotation(cydRotation);
   SCREEN_W = tft.width();
   SCREEN_H = tft.height();
+  // Never let a bogus panel report produce a zero/negative canvas - every
+  // layout below divides by these, and a 0 would take the whole UI out.
+  if (SCREEN_W <= 0) SCREEN_W = 240;
+  if (SCREEN_H <= 0) SCREEN_H = 320;
+}
+
+// ---------- recalibrate on every new firmware ----------
+// LittleFS survives a normal firmware upload, so touch calibration
+// captured once against a mis-configured display would otherwise persist
+// across every future flash - and because the interactive calibration only
+// runs when no saved file exists, it would never reappear to let you redo
+// it. Stamping the build and wiping calibration when the stamp changes
+// means each new flash starts from a fresh calibration.
+#define CYD_BUILD_PATH "/cyd_build.txt"
+static const char CYD_BUILD_ID[] = __DATE__ " " __TIME__;
+
+bool cydFirmwareChanged() {
+  String stored;
+  File f = LittleFS.open(CYD_BUILD_PATH, "r");
+  if (f) {
+    stored = f.readString();
+    f.close();
+  }
+  if (stored == CYD_BUILD_ID) return false;
+  File w = LittleFS.open(CYD_BUILD_PATH, "w");
+  if (w) {
+    w.print(CYD_BUILD_ID);
+    w.close();
+  }
+  return true;
 }
 
 // Touch axis correction, applied to the coordinates LGFX hands back rather
@@ -2839,12 +2869,16 @@ void cydDrawSettings() {
   const int pad = 8, gap = 6, rowH = 40, stepW = 52;
   int y = CYD_BANNER_H + pad;
 
+  // Every label goes through truncateToWidth() against the space actually
+  // available. The previous version drew these raw, and both labels were
+  // wider than a 240px panel - text ran off the edge and collided with
+  // whatever was beside it.
   tft.setFont(&fonts::FreeSans9pt7b);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setTextDatum(textdatum_t::top_left);
 
   // --- screen rotation ---
-  tft.drawString("Screen rotation (4-7 = mirrored)", pad, y);
+  tft.drawString(truncateToWidth("Screen rotation", SCREEN_W - 2 * pad), pad, y);
   y += 20;
   cydDrawButton(pad, y, stepW, rowH, "<", TFT_DARKGREY, TFT_WHITE, CYD_ACTION_ROT_PREV);
   tft.setFont(&fonts::FreeSansBold12pt7b);
@@ -2855,10 +2889,10 @@ void cydDrawSettings() {
   cydDrawButton(SCREEN_W - pad - stepW, y, stepW, rowH, ">", TFT_DARKGREY, TFT_WHITE, CYD_ACTION_ROT_NEXT);
   y += rowH + gap + 6;
 
-  // --- touch rotation ---
+  // --- touch axis fix ---
   tft.setFont(&fonts::FreeSans9pt7b);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawString("Touch fix (only if taps land wrong)", pad, y);
+  tft.drawString(truncateToWidth("Touch fix", SCREEN_W - 2 * pad), pad, y);
   y += 20;
   cydDrawButton(pad, y, stepW, rowH, "<", TFT_DARKGREY, TFT_WHITE, CYD_ACTION_TROT_PREV);
   tft.setFont(&fonts::FreeSansBold12pt7b);
@@ -2869,11 +2903,16 @@ void cydDrawSettings() {
   cydDrawButton(SCREEN_W - pad - stepW, y, stepW, rowH, ">", TFT_DARKGREY, TFT_WHITE, CYD_ACTION_TROT_NEXT);
   y += rowH + gap + 10;
 
-  cydDrawButton(pad, y, SCREEN_W - 2 * pad, rowH, "Recalibrate touch", TFT_DARKGREEN, TFT_WHITE, CYD_ACTION_RECALIBRATE);
-
-  // Back pinned to the bottom, not flowed after the rows above, so it's
-  // always reachable even if the rows ever grow.
-  cydDrawButton(pad, SCREEN_H - pad - rowH, SCREEN_W - 2 * pad, rowH, "Back", TFT_NAVY, TFT_WHITE, CYD_ACTION_BACK_HOME);
+  // Back is pinned to the bottom so it's always reachable; Recalibrate is
+  // only drawn if it genuinely fits above it. On a short (landscape)
+  // panel the flowed rows above would otherwise run straight through the
+  // Back button - both drawn, overlapping, with two live tap zones in the
+  // same place.
+  int backY = SCREEN_H - pad - rowH;
+  if (y + rowH + gap <= backY) {
+    cydDrawButton(pad, y, SCREEN_W - 2 * pad, rowH, "Recalibrate touch", TFT_DARKGREEN, TFT_WHITE, CYD_ACTION_RECALIBRATE);
+  }
+  cydDrawButton(pad, backY, SCREEN_W - 2 * pad, rowH, "Back", TFT_NAVY, TFT_WHITE, CYD_ACTION_BACK_HOME);
 
   tft.endWrite();
 }
@@ -2887,24 +2926,22 @@ void cydDrawLearn() {
   tft.fillScreen(TFT_BLACK);
   cydDrawStatusBar(lastStatus);
 
+  const int pad = 8, rowH = 44;
+  int centerY = CYD_BANNER_H + (SCREEN_H - CYD_BANNER_H - rowH - pad) / 2;
+
   tft.setFont(&fonts::FreeSansBold12pt7b);
   tft.setTextDatum(textdatum_t::middle_center);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawString("Point remote &", SCREEN_W / 2, SCREEN_H / 2 - 40);
-  tft.drawString("press a button", SCREEN_W / 2, SCREEN_H / 2 - 10);
+  tft.drawString(truncateToWidth("Point remote &", SCREEN_W - 2 * pad), SCREEN_W / 2, centerY - 30);
+  tft.drawString(truncateToWidth("press a button", SCREEN_W - 2 * pad), SCREEN_W / 2, centerY);
   tft.setFont(&fonts::FreeSans9pt7b);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawString("Waiting for signal...", SCREEN_W / 2, SCREEN_H / 2 + 30);
+  tft.drawString(truncateToWidth("Waiting for signal...", SCREEN_W - 2 * pad), SCREEN_W / 2, centerY + 30);
   tft.setTextDatum(textdatum_t::top_left);
 
-  int footerY = SCREEN_H - 54;
-  tft.fillRoundRect(8, footerY, SCREEN_W - 16, 46, 8, TFT_MAROON);
-  tft.setFont(&fonts::FreeSansBold9pt7b);
-  tft.setTextDatum(textdatum_t::middle_center);
-  tft.setTextColor(TFT_WHITE, TFT_MAROON);
-  tft.drawString("Cancel", SCREEN_W / 2, footerY + 23);
-  tft.setTextDatum(textdatum_t::top_left);
-  cydAddZone(8, footerY, SCREEN_W - 16, 46, CYD_ACTION_CANCEL_LEARN);
+  // routed through the shared button painter so it matches every other
+  // screen and registers its tap zone the same way
+  cydDrawButton(pad, SCREEN_H - pad - rowH, SCREEN_W - 2 * pad, rowH, "Cancel", TFT_MAROON, TFT_WHITE, CYD_ACTION_CANCEL_LEARN);
 
   tft.endWrite();
 }
@@ -3055,16 +3092,36 @@ void cydRunDiagnostic() {
   tft.fillRect(halfW, halfH, SCREEN_W - halfW, SCREEN_H - halfH, TFT_YELLOW);
   tft.drawRect(0, 0, SCREEN_W, SCREEN_H, TFT_WHITE);
   tft.drawRect(1, 1, SCREEN_W - 2, SCREEN_H - 2, TFT_WHITE);  // doubled so a 1px border is easy to spot
+
+  // Corner labels are anchored with an explicit datum per corner rather
+  // than hand-computed pixel offsets - the previous version subtracted
+  // guessed label widths (SCREEN_W - 74) and inherited whatever text datum
+  // the last draw happened to leave set, so the right-hand labels could
+  // land wrong or overhang the edge entirely.
   tft.setFont(&fonts::FreeSansBold9pt7b);
-  tft.setTextColor(TFT_WHITE, TFT_RED);
-  tft.drawString("TOP-LEFT", 6, 6);
-  tft.setTextColor(TFT_WHITE, TFT_GREEN);
-  tft.drawString("TOP-RIGHT", SCREEN_W - 74, 6);
-  tft.setTextColor(TFT_WHITE, TFT_BLUE);
-  tft.drawString("BOTTOM-LEFT", 6, SCREEN_H - 24);
-  tft.setTextColor(TFT_WHITE, TFT_YELLOW);
-  tft.drawString("BOTTOM-RIGHT", SCREEN_W - 90, SCREEN_H - 24);
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextDatum(textdatum_t::top_left);
+  tft.drawString("TL", 6, 6);
+  tft.setTextDatum(textdatum_t::top_right);
+  tft.drawString("TR", SCREEN_W - 6, 6);
+  tft.setTextDatum(textdatum_t::bottom_left);
+  tft.drawString("BL", 6, SCREEN_H - 6);
+  tft.setTextDatum(textdatum_t::bottom_right);
+  tft.drawString("BR", SCREEN_W - 6, SCREEN_H - 6);
+
+  // What the firmware believes the panel is. If these numbers disagree
+  // with the physical glass, that is the bug - and it's readable straight
+  // off the screen instead of being inferred from how the layout looks.
+  tft.setTextDatum(textdatum_t::middle_center);
+  tft.setFont(&fonts::FreeSansBold12pt7b);
+  tft.setTextColor(TFT_BLACK);
+  tft.drawString(String(SCREEN_W) + " x " + String(SCREEN_H), SCREEN_W / 2, SCREEN_H / 2 - 14);
+  tft.drawString("rot " + String(cydRotation), SCREEN_W / 2, SCREEN_H / 2 + 14);
+  tft.setTextDatum(textdatum_t::top_left);
   tft.endWrite();
+
+  Serial.printf("CYD diagnostic: SCREEN_W=%d SCREEN_H=%d rotation=%u\n",
+                SCREEN_W, SCREEN_H, (unsigned)cydRotation);
   delay(6000);  // watchdog isn't armed yet at this point in setup() - safe to block here
 }
 
@@ -3139,6 +3196,11 @@ void setup() {
   // so orientation can be fixed without a re-flash.
   cydLoadDisplaySettings();
   cydApplyRotation();      // also refreshes SCREEN_W/SCREEN_H from the panel
+  // a new firmware upload always starts from a fresh calibration
+  if (cydFirmwareChanged()) {
+    Serial.println("New firmware detected - clearing saved touch calibration");
+    LittleFS.remove(CYD_CALIB_PATH);
+  }
 #else
   tft.setRotation(0);
   SCREEN_W = tft.width();
