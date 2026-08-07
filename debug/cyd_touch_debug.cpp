@@ -62,7 +62,11 @@ LGFX tft;
 SPIClass touchSPI(HSPI);
 
 // ---- live-adjustable state ----
-uint8_t  rotation  = 0;
+// Starts at 4, not 0: on this panel 0-3 all render mirrored (text
+// backwards). 4-7 are those same four rotations with the mirror bit set,
+// and 4 is the one confirmed correct on this hardware. Press 'r'/'R' to
+// step through if a different orientation is wanted.
+uint8_t  rotation  = 4;
 bool     swapXY    = false, invX = false, invY = false;
 uint16_t rawXmin   = 300, rawXmax = 3800;
 uint16_t rawYmin   = 300, rawYmax = 3800;
@@ -189,9 +193,15 @@ void printHelp() {
   Serial.println("  b  toggle RGB/BGR colour order");
   Serial.println("  w  wipe the screen (clear stray dots)");
   Serial.println("----------------------------------------");
-  Serial.println("Try 's' / 'x' / 'y' first - taps landing mirrored or on");
-  Serial.println("the wrong axis is usually one of those three. Use 'c' if");
-  Serial.println("taps are in the right general area but drift near edges.");
+  Serial.println("TEXT BACKWARDS/MIRRORED? That's the DISPLAY, not touch:");
+  Serial.println("  press 'r' until it reads correctly. 0-3 are plain");
+  Serial.println("  rotations, 4-7 are those same four MIRRORED - only 4-7");
+  Serial.println("  can un-mirror the text. ('n' is colour inversion, which");
+  Serial.println("  is a different thing and won't fix it.)");
+  Serial.println();
+  Serial.println("TAPS LANDING WRONG? That's touch: try 's' / 'x' / 'y',");
+  Serial.println("  usually one of those three. Use 'c' if taps are in the");
+  Serial.println("  right area but drift near the edges.");
   Serial.println();
 }
 
