@@ -87,6 +87,15 @@ bool learning = false;
 unsigned long learningStartedAt = 0;
 const unsigned long LEARN_TIMEOUT_MS = 30000;  // give up waiting for a signal after 30s
 int pendingLearnSlot = -1;     // if >= 0, the in-progress learn (above) is for this physical slot
+// If >= 0, the in-progress learn is for a virtual remote button: the
+// captured code is saved and assigned to that button in one step, which is
+// what makes "lay the remote out, then teach every button" work without
+// naming each code by hand first.
+int pendingLearnRemote = -1;
+int pendingLearnButton = -1;
+// Teach-all walks the current remote's un-coded buttons back to back,
+// re-arming the next learn as soon as one completes.
+bool teachAllActive = false;
 String lastStatus = "Booting...";
 
 // ---------- icons ----------
@@ -593,8 +602,100 @@ struct RemoteButton {
   CRGB color = DEFAULT_SLOT_COLOR;
   bool spacer = false;     // true = an invisible layout-only placeholder tile, not a real button
 };
-std::vector<RemoteButton> remoteButtons;
-int remoteColumns = 3;
+// A named remote is a layout plus its buttons. Several can exist (TV,
+// soundbar, projector...) and one is "current" - shown on the device
+// screen and edited in the web app.
+struct Remote {
+  String name;
+  int columns = 3;
+  std::vector<RemoteButton> buttons;
+};
+std::vector<Remote> remotes;
+int currentRemote = 0;
+
+// remotes is never allowed to be empty and currentRemote is always a valid
+// index - every path that could break that (load, delete, boot) calls this
+// straight after. That keeps the accessors below unconditionally safe
+// rather than every use site needing its own bounds check.
+void ensureRemoteValid() {
+  if (remotes.empty()) {
+    Remote r;
+    r.name = "Remote 1";
+    remotes.push_back(r);
+  }
+  if (currentRemote < 0 || currentRemote >= (int)remotes.size()) currentRemote = 0;
+}
+
+// The whole codebase predates multiple remotes and refers to the single
+// remote's data by these two names in ~50 places. Rather than hand-editing
+// every one without a compiler to catch a miss, they now resolve to the
+// current remote's fields. Macros specifically because they need no call
+// syntax at the use sites - and they are safe here: macros are not
+// expanded inside string literals, so the "remoteColumns" JSON key and the
+// JS in PAGE_HTML are untouched.
+#define remoteButtons (remotes[currentRemote].buttons)
+#define remoteColumns (remotes[currentRemote].columns)
+
+// Derives a code name for a button being taught, so laying out a remote
+// and then teaching it never requires typing a name per button. Uniqueness
+// is enforced against codeLibrary; re-teaching a button that already has a
+// code reuses that name (see startButtonLearn) so it overwrites in place
+// rather than accumulating tv_power_2, tv_power_3, ...
+String autoCodeName(int remoteIdx, int btnIdx) {
+  Remote &r = remotes[remoteIdx];
+  String base = r.buttons[btnIdx].name;
+  if (base.length() == 0) base = "btn" + String(btnIdx + 1);
+  String raw = r.name + "_" + base;
+  String slug;
+  for (size_t i = 0; i < raw.length(); i++) {
+    char c = raw.charAt(i);
+    if (isalnum((unsigned char)c)) slug += (char)tolower(c);
+    else if (slug.length() && slug.charAt(slug.length() - 1) != '_') slug += '_';
+  }
+  while (slug.length() && slug.charAt(slug.length() - 1) == '_') slug.remove(slug.length() - 1);
+  if (slug.length() == 0) slug = "code";
+  String out = slug;
+  int n = 2;
+  while (codeLibrary.count(out)) out = slug + "_" + String(n++);
+  return out;
+}
+
+// Next button with no code yet, skipping spacers. -1 when the remote is
+// fully taught - which is how teach-all knows it's finished.
+int nextUntaughtButton(int from) {
+  for (int i = from; i < (int)remoteButtons.size(); i++) {
+    if (!remoteButtons[i].spacer && remoteButtons[i].codeName.length() == 0) return i;
+  }
+  return -1;
+}
+
+bool startButtonLearn(int idx) {
+  ensureRemoteValid();
+  if (idx < 0 || idx >= (int)remoteButtons.size()) return false;
+  if (remoteButtons[idx].spacer) return false;
+  String name = remoteButtons[idx].codeName;
+  if (name.length() == 0) name = autoCodeName(currentRemote, idx);
+  pendingLearnName = name;
+  pendingLearnSlot = -1;
+  pendingLearnRemote = currentRemote;
+  pendingLearnButton = idx;
+  learning = true;
+  learningStartedAt = millis();
+  String label = remoteButtons[idx].name.length() ? remoteButtons[idx].name
+                                                  : ("Button " + String(idx + 1));
+  updateScreen("Learning: " + label);
+  flashLeds(CRGB::Yellow, 150);
+  return true;
+}
+
+void stopTeachAll(const String &why) {
+  teachAllActive = false;
+  learning = false;
+  pendingLearnName = "";
+  pendingLearnRemote = -1;
+  pendingLearnButton = -1;
+  updateScreen(why);
+}
 
 // ---------- persistence (LittleFS + JSON) ----------
 // Codes/slots/remote buttons are saved to flash after every mutation and
@@ -631,16 +732,22 @@ bool saveProfile() {
   colorsObj["accent"] = colorToHex(accentColor);
   colorsObj["wave"] = colorToHex(waveColor);
 
-  JsonArray remoteArr = doc["remote"].to<JsonArray>();
-  for (auto &b : remoteButtons) {
-    JsonObject bObj = remoteArr.add<JsonObject>();
-    bObj["name"] = b.name;
-    bObj["code"] = b.codeName;
-    bObj["icon"] = b.icon;
-    bObj["color"] = colorToHex(b.color);
-    bObj["spacer"] = b.spacer;
+  JsonArray remotesArr = doc["remotes"].to<JsonArray>();
+  for (auto &r : remotes) {
+    JsonObject rObj = remotesArr.add<JsonObject>();
+    rObj["name"] = r.name;
+    rObj["columns"] = r.columns;
+    JsonArray btnArr = rObj["buttons"].to<JsonArray>();
+    for (auto &b : r.buttons) {
+      JsonObject bObj = btnArr.add<JsonObject>();
+      bObj["name"] = b.name;
+      bObj["code"] = b.codeName;
+      bObj["icon"] = b.icon;
+      bObj["color"] = colorToHex(b.color);
+      bObj["spacer"] = b.spacer;
+    }
   }
-  doc["remoteColumns"] = remoteColumns;
+  doc["currentRemote"] = currentRemote;
 
   // write to a temp file and rename it over the real one rather than
   // writing PROFILE_PATH directly - LittleFS's rename atomically replaces
@@ -751,27 +858,57 @@ bool loadProfile() {
   const char* waveHex = colorsObj["wave"].as<const char*>();
   if (waveHex) waveColor = parseHexColor(waveHex, waveColor);
 
-  remoteButtons.clear();
-  JsonArray remoteArr = doc["remote"].as<JsonArray>();
-  for (JsonVariant bv : remoteArr) {
-    JsonObject bObj = bv.as<JsonObject>();
-    RemoteButton b;
-    const char* bName = bObj["name"].as<const char*>();
-    b.name = bName ? String(bName) : "";
-    const char* bCode = bObj["code"].as<const char*>();
-    b.codeName = bCode ? String(bCode) : "";
-    b.icon = bObj["icon"] | (int)ICON_NONE;
-    const char* bColorHex = bObj["color"].as<const char*>();
-    b.color = bColorHex ? parseHexColor(bColorHex, DEFAULT_SLOT_COLOR) : DEFAULT_SLOT_COLOR;
-    b.spacer = bObj["spacer"] | false;  // missing (pre-spacer saves) = false
-    remoteButtons.push_back(b);
-  }
-  remoteColumns = doc["remoteColumns"] | 3;
-  if (remoteColumns < 1) remoteColumns = 1;
-  if (remoteColumns > 6) remoteColumns = 6;
+  // Parses one remote's button array - shared by the current multi-remote
+  // format and the single-remote format it replaced.
+  auto readButtons = [](JsonArray arr, std::vector<RemoteButton> &out) {
+    out.clear();
+    for (JsonVariant bv : arr) {
+      JsonObject bObj = bv.as<JsonObject>();
+      RemoteButton b;
+      const char* bName = bObj["name"].as<const char*>();
+      b.name = bName ? String(bName) : "";
+      const char* bCode = bObj["code"].as<const char*>();
+      b.codeName = bCode ? String(bCode) : "";
+      b.icon = bObj["icon"] | (int)ICON_NONE;
+      const char* bColorHex = bObj["color"].as<const char*>();
+      b.color = bColorHex ? parseHexColor(bColorHex, DEFAULT_SLOT_COLOR) : DEFAULT_SLOT_COLOR;
+      b.spacer = bObj["spacer"] | false;  // missing (pre-spacer saves) = false
+      out.push_back(b);
+    }
+  };
 
-  Serial.printf("loadProfile: loaded %u codes, %u remote buttons\n",
-                (unsigned)codeLibrary.size(), (unsigned)remoteButtons.size());
+  remotes.clear();
+  if (doc["remotes"].is<JsonArray>()) {
+    for (JsonVariant rv : doc["remotes"].as<JsonArray>()) {
+      JsonObject rObj = rv.as<JsonObject>();
+      Remote r;
+      const char* rName = rObj["name"].as<const char*>();
+      r.name = rName ? String(rName) : "Remote";
+      r.columns = rObj["columns"] | 3;
+      if (r.columns < 1) r.columns = 1;
+      if (r.columns > 6) r.columns = 6;
+      readButtons(rObj["buttons"].as<JsonArray>(), r.buttons);
+      remotes.push_back(r);
+    }
+    currentRemote = doc["currentRemote"] | 0;
+  } else {
+    // pre-multi-remote profile: one unnamed remote at doc["remote"] with a
+    // sibling doc["remoteColumns"]. Migrate rather than discard.
+    Remote r;
+    r.name = "Remote 1";
+    r.columns = doc["remoteColumns"] | 3;
+    if (r.columns < 1) r.columns = 1;
+    if (r.columns > 6) r.columns = 6;
+    readButtons(doc["remote"].as<JsonArray>(), r.buttons);
+    remotes.push_back(r);
+    currentRemote = 0;
+  }
+  ensureRemoteValid();
+
+  Serial.printf("loadProfile: loaded %u codes, %u remotes (current '%s', %u buttons)\n",
+                (unsigned)codeLibrary.size(), (unsigned)remotes.size(),
+                remotes[currentRemote].name.c_str(),
+                (unsigned)remoteButtons.size());
   return true;
 }
 
@@ -848,7 +985,10 @@ void mqttClearDiscovery(const String &codeName) {
 void mqttPublishDiscovery() {
   if (!mqttClient.connected()) return;
   String deviceId = "irhomebase_" + String(hostname);
-  for (auto &b : remoteButtons) {
+  // every remote, not just the current one - Home Assistant should see all
+  // buttons regardless of which remote happens to be on screen
+  for (auto &r : remotes)
+  for (auto &b : r.buttons) {
     // spacers and buttons with no code assigned yet have nothing to expose
     // to HA (name is optional now, so mqttSlug(b.name) alone could also
     // collide across several nameless buttons - key off the code name,
@@ -1025,6 +1165,21 @@ void handleApiState() {
   json += "\"wave\":\"" + colorToHex(waveColor) + "\"";
   json += "},";
 
+  json += "\"teachAll\":" + String(teachAllActive ? "true" : "false") + ",";
+  json += "\"learnButton\":" + String(pendingLearnButton) + ",";
+
+  json += "\"currentRemote\":" + String(currentRemote) + ",";
+  json += "\"remotes\":[";
+  first = true;
+  for (auto &r : remotes) {
+    if (!first) json += ",";
+    first = false;
+    json += "{\"name\":\"" + jsonEscape(r.name) + "\",";
+    json += "\"buttons\":" + String((int)r.buttons.size()) + "}";
+  }
+  json += "],";
+
+  // the selected remote's layout, expanded - the UI renders this one
   json += "\"remoteColumns\":" + String(remoteColumns) + ",";
   json += "\"remote\":[";
   first = true;
@@ -1108,21 +1263,31 @@ static const char PAGE_HTML[] PROGMEM = R"HTML(<!doctype html>
 </div>
 
 <div class='tabPanel active' id='tab-remote'>
-  <h2>Your remote</h2>
+  <div class='item'>
+    <select id='remoteSel' style='flex:1 1 120px'></select>
+    <button type='button' class='secondary' id='remoteNewBtn'>New</button>
+    <button type='button' class='secondary' id='remoteRenameBtn'>Rename</button>
+    <button type='button' class='danger' id='remoteDelBtn'>Delete</button>
+  </div>
+
+  <div id='teachBanner'></div>
+
+  <div id='remoteGrid'></div>
+
   <div class='item'>
     <span class='name'>Columns</span>
     <select id='remoteColumnsSel'>
       <option value='1'>1</option><option value='2'>2</option><option value='3'>3</option>
       <option value='4'>4</option><option value='5'>5</option><option value='6'>6</option>
     </select>
+    <button type='button' id='teachAllBtn'>Teach all</button>
   </div>
-  <div id='remoteGrid'></div>
 
   <h3>Edit buttons</h3>
+  <p class='empty'>"Learn" captures a code straight into that button - no naming needed. "Teach all" walks every button that still needs one.</p>
   <div id='remoteList'></div>
 
-  <h3>Add button</h3>
-  <p class='empty'>Pick a symbol and color - a code is optional if you just want to lay a button out first and hook it up later.</p>
+  <h3>Add buttons</h3>
   <form class='inline' id='remoteAddForm'>
     <div class='editRow'>
       <div class='iconPreview' id='remoteAddPreview'></div>
@@ -1132,7 +1297,15 @@ static const char PAGE_HTML[] PROGMEM = R"HTML(<!doctype html>
     <select id='remoteAddCode'></select>
     <div class='editRow'>
       <button type='submit'>Add button</button>
-      <button type='button' class='secondary' id='remoteAddSpacerBtn'>Add empty space</button>
+      <button type='button' class='secondary' id='remoteAddSpacerBtn'>Add space</button>
+    </div>
+    <div class='editRow'>
+      <span class='name'>Add several blank</span>
+      <select id='remoteAddManyCount'>
+        <option>2</option><option>4</option><option selected>6</option>
+        <option>8</option><option>10</option><option>12</option><option>16</option><option>20</option>
+      </select>
+      <button type='button' class='secondary' id='remoteAddManyBtn'>Add</button>
     </div>
   </form>
 </div>
@@ -1385,6 +1558,41 @@ document.getElementById('remoteAddForm').addEventListener('submit', function (e)
 document.getElementById('remoteAddSpacerBtn').addEventListener('click', function () {
   mutate('/remote/add', {spacer: '1'});
 });
+document.getElementById('remoteAddManyBtn').addEventListener('click', function () {
+  mutate('/remote/addmany', {
+    count: document.getElementById('remoteAddManyCount').value,
+    icon: document.getElementById('remoteAddIcon').value,
+    color: document.getElementById('remoteAddColor').value
+  });
+});
+
+// ---- multiple remotes ----
+document.getElementById('remoteSel').addEventListener('change', function () {
+  mutate('/remotes/select', {index: this.value});
+});
+document.getElementById('remoteNewBtn').addEventListener('click', function () {
+  const n = prompt('Name for the new remote:', 'Remote');
+  if (n && n.trim()) mutate('/remotes/add', {name: n.trim()});
+});
+document.getElementById('remoteRenameBtn').addEventListener('click', function () {
+  const sel = document.getElementById('remoteSel');
+  const cur = sel.options[sel.selectedIndex] ? sel.options[sel.selectedIndex].dataset.rawname : '';
+  const n = prompt('Rename this remote:', cur || '');
+  if (n && n.trim()) mutate('/remotes/rename', {index: sel.value, name: n.trim()});
+});
+document.getElementById('remoteDelBtn').addEventListener('click', function () {
+  const sel = document.getElementById('remoteSel');
+  const cur = sel.options[sel.selectedIndex] ? sel.options[sel.selectedIndex].dataset.rawname : 'this remote';
+  if (confirm("Delete '" + cur + "'? Its buttons go too, but the learned codes stay in the library."))
+    mutate('/remotes/delete', {index: sel.value});
+});
+
+// ---- teach ----
+document.getElementById('teachAllBtn').addEventListener('click', function () {
+  if (this.dataset.stop === '1') { mutate('/remote/teachstop', {}); return; }
+  mutate('/remote/teachall', {});
+});
+function learnIntoButton(i) { mutate('/remote/learn', {index: String(i)}); }
 function updateAddPreview() {
   const preview = document.getElementById('remoteAddPreview');
   const color = document.getElementById('remoteAddColor').value;
@@ -1452,11 +1660,47 @@ function renderRemote(state) {
   const colSel = document.getElementById('remoteColumnsSel');
   if (document.activeElement !== colSel) colSel.value = String(state.remoteColumns);
 
+  // remote picker
+  const rSel = document.getElementById('remoteSel');
+  if (document.activeElement !== rSel) {
+    rSel.innerHTML = '';
+    (state.remotes || []).forEach(function (r, i) {
+      const opt = document.createElement('option');
+      opt.value = String(i);
+      opt.textContent = r.name + '  (' + r.buttons + ')';
+      opt.dataset.rawname = r.name;   // textContent has the count appended; rename/delete need the bare name
+      if (i === state.currentRemote) opt.selected = true;
+      rSel.appendChild(opt);
+    });
+  }
+  document.getElementById('remoteDelBtn').disabled = (state.remotes || []).length < 2;
+
+  // teach-all banner + button state
+  const teachBtn = document.getElementById('teachAllBtn');
+  const banner = document.getElementById('teachBanner');
+  const untaught = state.remote.filter(function (b) { return !b.spacer && !b.code; }).length;
+  if (state.teachAll) {
+    teachBtn.textContent = 'Stop';
+    teachBtn.dataset.stop = '1';
+    teachBtn.className = 'danger';
+    banner.innerHTML = "<div class='item' style='background:#5a4a00'>Teaching button " +
+      (state.learnButton + 1) + " - point the original remote at the device and press it. " +
+      untaught + " left.</div>";
+  } else {
+    teachBtn.textContent = 'Teach all';
+    teachBtn.dataset.stop = '';
+    teachBtn.className = '';
+    teachBtn.disabled = untaught === 0;
+    banner.innerHTML = untaught === 0
+      ? ''
+      : "<div class='item'><span class='name'>" + untaught + " button(s) still need a code</span></div>";
+  }
+
   const grid = document.getElementById('remoteGrid');
   grid.innerHTML = '';
   grid.style.gridTemplateColumns = 'repeat(' + state.remoteColumns + ', 1fr)';
   if (state.remote.length === 0) {
-    grid.innerHTML = "<p class='empty'>No remote buttons yet - add one below.</p>";
+    grid.innerHTML = "<p class='empty'>No buttons yet - add some below, then hit Teach all.</p>";
   }
   state.remote.forEach(function (b) {
     const tile = document.createElement('button');
@@ -1528,6 +1772,17 @@ function renderRemote(state) {
     fillCodeSelect(codeSel, state.codes, b.code);
     codeSel.addEventListener('change', function () { mutate('/remote/update', {index: String(i), code: codeSel.value}); });
     row.appendChild(codeSel);
+
+    // teaching into the button directly is the main path - picking an
+    // existing code from the dropdown above is the exception, not the rule
+    const learnBtn = makeButton(b.code ? 'Re-learn' : 'Learn',
+                                b.code ? 'secondary' : '',
+                                function () { learnIntoButton(i); });
+    if (state.teachAll && state.learnButton === i) {
+      learnBtn.textContent = 'waiting...';
+      learnBtn.className = 'danger';
+    }
+    row.appendChild(learnBtn);
 
     const btns = document.createElement('div');
     btns.className = 'moveDelBtns';
@@ -1890,7 +2145,12 @@ void handleRoot() {
 }
 
 #ifdef BOARD_CYD
-void cydShowLearnScreen();  // defined in the CYD screen-manager section further down
+// Both defined in the CYD screen-manager section further down. Wrapped as
+// helpers rather than inlining `if (currentCydScreen == CYD_HOME)` at each
+// call site, because the CydScreen enum isn't declared until that section
+// and these are called from web handlers defined above it.
+void cydShowLearnScreen();
+void cydRefreshHome();   // redraws Home only if Home is what's showing
 #endif
 
 // Also the entry point CYD's on-screen "Learn New" tap uses (see
@@ -1944,10 +2204,13 @@ void handleDeleteCode() {
       for (int i = 0; i < NUM_SLOTS; i++) {
         if (slotCodeName[i] == name) slotCodeName[i] = "";
       }
+      // every remote - a deleted code can be referenced by buttons on
+      // remotes other than the one currently selected
       bool hadRemoteButton = false;
-      for (auto &b : remoteButtons) {
-        if (b.codeName == name) { b.codeName = ""; hadRemoteButton = true; }
-      }
+      for (auto &r : remotes)
+        for (auto &b : r.buttons) {
+          if (b.codeName == name) { b.codeName = ""; hadRemoteButton = true; }
+        }
       // MQTT discovery is keyed by codeName - a deleted code's entity would
       // otherwise linger in HA forever since nothing else republishes it
       if (hadRemoteButton) mqttClearDiscovery(name);
@@ -1972,9 +2235,10 @@ void handleRenameCode() {
         if (slotCodeName[i] == oldName) slotCodeName[i] = newName;
       }
       bool hadRemoteButton = false;
-      for (auto &b : remoteButtons) {
-        if (b.codeName == oldName) { b.codeName = newName; hadRemoteButton = true; }
-      }
+      for (auto &r : remotes)
+        for (auto &b : r.buttons) {
+          if (b.codeName == oldName) { b.codeName = newName; hadRemoteButton = true; }
+        }
       // discovery is keyed by codeName - move the HA entity from the old
       // topic to the new one instead of leaving a stale duplicate behind
       if (hadRemoteButton) {
@@ -2263,6 +2527,183 @@ void handleRemoteColumns() {
   }
   remoteColumns = n;
   markProfileDirty();
+  finishRequest();
+}
+
+// ---------- multiple remotes ----------
+// /remotes/add?name=X - creates an empty remote and switches to it
+void handleRemotesAdd() {
+  String name = server.hasArg("name") ? server.arg("name") : "";
+  name.trim();
+  if (name.length() == 0) name = "Remote " + String((int)remotes.size() + 1);
+  Remote r;
+  r.name = name;
+  remotes.push_back(r);
+  currentRemote = (int)remotes.size() - 1;   // switch to what was just made
+  updateScreen("Remote added: " + name);
+  markProfileDirty();
+  finishRequest();
+}
+
+// /remotes/select?index=N - which remote the device screen shows and the
+// web app edits
+void handleRemotesSelect() {
+  if (!server.hasArg("index")) {
+    server.send(400, "text/plain", "Missing index");
+    return;
+  }
+  int idx = server.arg("index").toInt();
+  if (idx < 0 || idx >= (int)remotes.size()) {
+    server.send(400, "text/plain", "Index out of range");
+    return;
+  }
+  currentRemote = idx;
+  updateScreen("Remote: " + remotes[idx].name);
+  markProfileDirty();
+#ifdef BOARD_CYD
+  cydRefreshHome();
+#endif
+  finishRequest();
+}
+
+// /remotes/rename?index=N&name=X
+void handleRemotesRename() {
+  if (!server.hasArg("index") || !server.hasArg("name")) {
+    server.send(400, "text/plain", "Missing index or name");
+    return;
+  }
+  int idx = server.arg("index").toInt();
+  if (idx < 0 || idx >= (int)remotes.size()) {
+    server.send(400, "text/plain", "Index out of range");
+    return;
+  }
+  String name = server.arg("name");
+  name.trim();
+  if (name.length() == 0) {
+    server.send(400, "text/plain", "Name can't be empty");
+    return;
+  }
+  remotes[idx].name = name;
+  markProfileDirty();
+  finishRequest();
+}
+
+// /remotes/delete?index=N - the remote's buttons go with it, but the codes
+// they referenced stay in the library (they may be used elsewhere, and
+// losing captured codes to a layout edit would be a nasty surprise)
+void handleRemotesDelete() {
+  if (!server.hasArg("index")) {
+    server.send(400, "text/plain", "Missing index");
+    return;
+  }
+  int idx = server.arg("index").toInt();
+  if (idx < 0 || idx >= (int)remotes.size()) {
+    server.send(400, "text/plain", "Index out of range");
+    return;
+  }
+  if (remotes.size() <= 1) {
+    server.send(400, "text/plain", "Can't delete the only remote");
+    return;
+  }
+  String name = remotes[idx].name;
+  for (auto &b : remotes[idx].buttons) {
+    if (b.codeName.length()) mqttClearDiscovery(b.codeName);
+  }
+  remotes.erase(remotes.begin() + idx);
+  if (currentRemote >= idx) currentRemote--;
+  ensureRemoteValid();
+  updateScreen("Remote deleted: " + name);
+  markProfileDirty();
+  mqttPublishDiscovery();
+#ifdef BOARD_CYD
+  cydRefreshHome();
+#endif
+  finishRequest();
+}
+
+// /remote/addmany?count=N[&icon=N&color=%23rrggbb] - bulk-create blank
+// buttons so a layout can be roughed out in one action instead of tapping
+// "add" a dozen times.
+void handleRemoteAddMany() {
+  if (!server.hasArg("count")) {
+    server.send(400, "text/plain", "Missing count");
+    return;
+  }
+  int count = server.arg("count").toInt();
+  if (count < 1 || count > 40) {
+    server.send(400, "text/plain", "count must be 1-40");
+    return;
+  }
+  int icon = server.hasArg("icon") ? server.arg("icon").toInt() : (int)ICON_NONE;
+  if (icon < 0 || icon >= ICON_COUNT) icon = ICON_NONE;
+  CRGB color = server.hasArg("color") ? parseHexColor(server.arg("color"), DEFAULT_SLOT_COLOR)
+                                      : DEFAULT_SLOT_COLOR;
+  for (int i = 0; i < count; i++) {
+    RemoteButton b;
+    b.icon = (uint8_t)icon;
+    b.color = color;
+    remoteButtons.push_back(b);
+  }
+  updateScreen("Added " + String(count) + " buttons");
+  markProfileDirty();
+  finishRequest();
+}
+
+// /remote/learn?index=N - learn a code straight into that button. The code
+// is named automatically and assigned on capture, so a laid-out remote can
+// be taught without naming anything by hand.
+void handleRemoteLearnButton() {
+  if (!server.hasArg("index")) {
+    server.send(400, "text/plain", "Missing index");
+    return;
+  }
+  int idx = server.arg("index").toInt();
+  if (idx < 0 || idx >= (int)remoteButtons.size()) {
+    server.send(400, "text/plain", "Index out of range");
+    return;
+  }
+  if (remoteButtons[idx].spacer) {
+    server.send(400, "text/plain", "That's a spacer, not a button");
+    return;
+  }
+  teachAllActive = false;   // an explicit single-button learn ends any run
+  if (!startButtonLearn(idx)) {
+    server.send(400, "text/plain", "Couldn't start learn");
+    return;
+  }
+#ifdef BOARD_CYD
+  cydShowLearnScreen();
+#endif
+  finishRequest();
+}
+
+// /remote/teachall - walk every untaught button in the current remote,
+// re-arming automatically after each capture (see the learn-complete
+// branch in loop()).
+void handleRemoteTeachAll() {
+  int next = nextUntaughtButton(0);
+  if (next < 0) {
+    server.send(400, "text/plain", "Every button on this remote already has a code");
+    return;
+  }
+  teachAllActive = true;
+  if (!startButtonLearn(next)) {
+    teachAllActive = false;
+    server.send(400, "text/plain", "Couldn't start teach-all");
+    return;
+  }
+#ifdef BOARD_CYD
+  cydShowLearnScreen();
+#endif
+  finishRequest();
+}
+
+// /remote/teachstop
+void handleRemoteTeachStop() {
+  stopTeachAll("Teach all stopped");
+#ifdef BOARD_CYD
+  if (currentCydScreen == CYD_LEARN) cydShowScreen(CYD_HOME);
+#endif
   finishRequest();
 }
 
@@ -2576,7 +3017,7 @@ void initWatchdog() {
 
 const int CYD_BANNER_H = 50;  // persistent status strip, shared across every CYD screen
 
-enum CydScreen { CYD_HOME, CYD_LEARN, CYD_SETTINGS, CYD_TOUCHTEST };
+enum CydScreen { CYD_HOME, CYD_LEARN, CYD_SETTINGS, CYD_TOUCHTEST, CYD_REMOTES, CYD_ADVANCED };
 CydScreen currentCydScreen = CYD_HOME;
 
 struct TapZone {
@@ -2603,6 +3044,13 @@ const int CYD_ACTION_ROT_PREV = -9;
 const int CYD_ACTION_TROT_NEXT = -10;
 const int CYD_ACTION_TROT_PREV = -11;
 const int CYD_ACTION_TOUCHTEST = -13;
+const int CYD_ACTION_REMOTES = -14;      // open the remote picker
+const int CYD_ACTION_TEACHALL = -15;
+const int CYD_ACTION_ADVANCED = -16;     // touch settings live behind this now
+const int CYD_ACTION_BACK_SETTINGS = -17;
+// remote picker entries are encoded as -100 - index, keeping them clear of
+// the fixed action codes above and of the >=0 button indices used on Home
+const int CYD_ACTION_REMOTE_BASE = -100;
 
 int cydHomePage = 0;
 const int CYD_COLS_MAX = 4;      // wider remoteColumns settings get clamped here for legibility - the full column count still applies on the web Remote tab
@@ -2912,18 +3360,38 @@ void cydDrawSettings() {
   tft.fillScreen(TFT_BLACK);
   cydDrawStatusBar("Settings");
 
+  const int pad = 8, gap = 6, rowH = 42;
+  int y = CYD_BANNER_H + pad;
+
+  // Everyday things first; the display/touch calibration knobs are behind
+  // "Advanced" now that the right values are locked in and shouldn't be
+  // one stray tap away.
+  cydDrawButton(pad, y, SCREEN_W - 2 * pad, rowH, "Remotes", TFT_NAVY, TFT_WHITE, CYD_ACTION_REMOTES);
+  y += rowH + gap;
+  cydDrawButton(pad, y, SCREEN_W - 2 * pad, rowH, "Teach all buttons", TFT_DARKGREEN, TFT_WHITE, CYD_ACTION_TEACHALL);
+  y += rowH + gap;
+  cydDrawButton(pad, y, SCREEN_W - 2 * pad, rowH, "Advanced", TFT_DARKGREY, TFT_WHITE, CYD_ACTION_ADVANCED);
+
+  cydDrawButton(pad, SCREEN_H - pad - rowH, SCREEN_W - 2 * pad, rowH, "Back", TFT_NAVY, TFT_WHITE, CYD_ACTION_BACK_HOME);
+  tft.endWrite();
+}
+
+// Advanced: display/touch orientation. Separated from Settings because
+// these are set-once hardware values - keeping them one level down means a
+// misplaced tap can't knock the screen sideways during normal use.
+void cydDrawAdvanced() {
+  cydZoneCount = 0;
+  tft.startWrite();
+  tft.fillScreen(TFT_BLACK);
+  cydDrawStatusBar("Advanced");
+
   const int pad = 8, gap = 6, rowH = 40, stepW = 52;
   int y = CYD_BANNER_H + pad;
 
-  // Every label goes through truncateToWidth() against the space actually
-  // available. The previous version drew these raw, and both labels were
-  // wider than a 240px panel - text ran off the edge and collided with
-  // whatever was beside it.
   tft.setFont(&fonts::FreeSans9pt7b);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setTextDatum(textdatum_t::top_left);
 
-  // --- screen rotation ---
   tft.drawString(truncateToWidth("Screen rotation", SCREEN_W - 2 * pad), pad, y);
   y += 20;
   cydDrawButton(pad, y, stepW, rowH, "<", TFT_DARKGREY, TFT_WHITE, CYD_ACTION_ROT_PREV);
@@ -2935,7 +3403,6 @@ void cydDrawSettings() {
   cydDrawButton(SCREEN_W - pad - stepW, y, stepW, rowH, ">", TFT_DARKGREY, TFT_WHITE, CYD_ACTION_ROT_NEXT);
   y += rowH + gap + 6;
 
-  // --- touch axis fix ---
   tft.setFont(&fonts::FreeSans9pt7b);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.drawString(truncateToWidth("Touch fix", SCREEN_W - 2 * pad), pad, y);
@@ -2949,17 +3416,51 @@ void cydDrawSettings() {
   cydDrawButton(SCREEN_W - pad - stepW, y, stepW, rowH, ">", TFT_DARKGREY, TFT_WHITE, CYD_ACTION_TROT_NEXT);
   y += rowH + gap + 10;
 
-  // Back is pinned to the bottom so it's always reachable; Recalibrate is
-  // only drawn if it genuinely fits above it. On a short (landscape)
-  // panel the flowed rows above would otherwise run straight through the
-  // Back button - both drawn, overlapping, with two live tap zones in the
-  // same place.
   int backY = SCREEN_H - pad - rowH;
   if (y + rowH + gap <= backY) {
     cydDrawButton(pad, y, SCREEN_W - 2 * pad, rowH, "Touch test", TFT_PURPLE, TFT_WHITE, CYD_ACTION_TOUCHTEST);
   }
-  cydDrawButton(pad, backY, SCREEN_W - 2 * pad, rowH, "Back", TFT_NAVY, TFT_WHITE, CYD_ACTION_BACK_HOME);
+  cydDrawButton(pad, backY, SCREEN_W - 2 * pad, rowH, "Back", TFT_NAVY, TFT_WHITE, CYD_ACTION_BACK_SETTINGS);
+  tft.endWrite();
+}
 
+// Remote picker: one row per remote, current one highlighted. Paged the
+// same way Home is, so a long list stays reachable.
+int cydRemotePage = 0;
+
+void cydDrawRemotes() {
+  cydZoneCount = 0;
+  tft.startWrite();
+  tft.fillScreen(TFT_BLACK);
+  cydDrawStatusBar("Remotes");
+
+  const int pad = 8, gap = 6, rowH = 42;
+  int y = CYD_BANNER_H + pad;
+  int backY = SCREEN_H - pad - rowH;
+  int perPage = max(1, (backY - gap - y) / (rowH + gap));
+  int total = (int)remotes.size();
+  int pages = max(1, (total + perPage - 1) / perPage);
+  if (cydRemotePage >= pages) cydRemotePage = pages - 1;
+  if (cydRemotePage < 0) cydRemotePage = 0;
+
+  int start = cydRemotePage * perPage;
+  int end = min(total, start + perPage);
+  for (int i = start; i < end; i++) {
+    bool cur = (i == currentRemote);
+    uint16_t bg = cur ? tft.color565(accentColor.r, accentColor.g, accentColor.b) : TFT_DARKGREY;
+    uint16_t fg = cur ? contrastTextColor(accentColor) : TFT_WHITE;
+    String label = remotes[i].name + "  (" + String((int)remotes[i].buttons.size()) + ")";
+    cydDrawButton(pad, y, SCREEN_W - 2 * pad, rowH, label, bg, fg, CYD_ACTION_REMOTE_BASE - i);
+    y += rowH + gap;
+  }
+
+  if (pages > 1) {
+    int half = (SCREEN_W - 2 * pad - gap) / 2;
+    int navY = backY - rowH - gap;
+    cydDrawButton(pad, navY, half, rowH, "< Prev", TFT_DARKGREY, TFT_WHITE, CYD_ACTION_PAGE_PREV);
+    cydDrawButton(pad + half + gap, navY, half, rowH, "Next >", TFT_DARKGREY, TFT_WHITE, CYD_ACTION_PAGE_NEXT);
+  }
+  cydDrawButton(pad, backY, SCREEN_W - 2 * pad, rowH, "Back", TFT_NAVY, TFT_WHITE, CYD_ACTION_BACK_SETTINGS);
   tft.endWrite();
 }
 
@@ -3053,6 +3554,11 @@ void cydShowScreen(CydScreen s) {
     cydDrawHome();
   } else if (s == CYD_SETTINGS) {
     cydDrawSettings();
+  } else if (s == CYD_ADVANCED) {
+    cydDrawAdvanced();
+  } else if (s == CYD_REMOTES) {
+    cydRemotePage = 0;
+    cydDrawRemotes();
   } else if (s == CYD_TOUCHTEST) {
     cydDrawTouchTest();
   } else {
@@ -3064,6 +3570,7 @@ void cydShowScreen(CydScreen s) {
 // CydScreen exists) can trigger this without needing the enum visible at
 // its forward-declaration point.
 void cydShowLearnScreen() { cydShowScreen(CYD_LEARN); }
+void cydRefreshHome() { if (currentCydScreen == CYD_HOME) cydDrawHome(); }
 
 // Dispatches a touch point to whichever action zone (if any) it lands in
 // on the currently active screen. Reuses the exact same shared triggers
@@ -3141,21 +3648,65 @@ void cydHandleTouch(int x, int y) {
       if (action == CYD_ACTION_BACK_HOME) {
         cydShowScreen(CYD_HOME);
         cydRedrawAt = 0;
+      } else if (action == CYD_ACTION_REMOTES) {
+        cydShowScreen(CYD_REMOTES);
+        cydRedrawAt = 0;
+      } else if (action == CYD_ACTION_ADVANCED) {
+        cydShowScreen(CYD_ADVANCED);
+        cydRedrawAt = 0;
+      } else if (action == CYD_ACTION_TEACHALL) {
+        int next = nextUntaughtButton(0);
+        if (next < 0) {
+          updateScreen("Nothing left to teach");
+          cydDrawSettings();
+        } else {
+          teachAllActive = true;
+          if (startButtonLearn(next)) cydShowScreen(CYD_LEARN);
+          else { teachAllActive = false; cydDrawSettings(); }
+        }
+        cydRedrawAt = 0;
+      }
+    } else if (currentCydScreen == CYD_ADVANCED) {
+      if (action == CYD_ACTION_BACK_SETTINGS) {
+        cydShowScreen(CYD_SETTINGS);
+        cydRedrawAt = 0;
       } else if (action == CYD_ACTION_ROT_NEXT || action == CYD_ACTION_ROT_PREV) {
         cydRotation = (action == CYD_ACTION_ROT_NEXT) ? (cydRotation + 1) & 7
                                                       : (cydRotation + 7) & 7;
         cydApplyRotation();       // takes effect immediately, including new SCREEN_W/H
         cydSaveDisplaySettings(); // ...and survives the next reboot
-        cydDrawSettings();
+        cydDrawAdvanced();
         cydRedrawAt = 0;
       } else if (action == CYD_ACTION_TROT_NEXT || action == CYD_ACTION_TROT_PREV) {
         cydTouchRotation = (action == CYD_ACTION_TROT_NEXT) ? (cydTouchRotation + 1) & 7
                                                             : (cydTouchRotation + 7) & 7;
         cydSaveDisplaySettings();  // no apply step needed - cydTransformTouch() reads the value live
-        cydDrawSettings();
+        cydDrawAdvanced();
         cydRedrawAt = 0;
       } else if (action == CYD_ACTION_TOUCHTEST) {
         cydShowScreen(CYD_TOUCHTEST);
+        cydRedrawAt = 0;
+      }
+    } else if (currentCydScreen == CYD_REMOTES) {
+      if (action == CYD_ACTION_BACK_SETTINGS) {
+        cydShowScreen(CYD_SETTINGS);
+        cydRedrawAt = 0;
+      } else if (action == CYD_ACTION_PAGE_PREV) {
+        cydRemotePage--;
+        cydDrawRemotes();
+        cydRedrawAt = 0;
+      } else if (action == CYD_ACTION_PAGE_NEXT) {
+        cydRemotePage++;
+        cydDrawRemotes();
+        cydRedrawAt = 0;
+      } else if (action <= CYD_ACTION_REMOTE_BASE) {
+        int idx = CYD_ACTION_REMOTE_BASE - action;
+        if (idx >= 0 && idx < (int)remotes.size()) {
+          currentRemote = idx;
+          markProfileDirty();
+          updateScreen("Remote: " + remotes[idx].name);
+          cydShowScreen(CYD_HOME);
+        }
         cydRedrawAt = 0;
       }
     }
@@ -3264,6 +3815,9 @@ void setup() {
   } else {
     loadProfile();
   }
+  // covers a failed/absent load too - remotes must never be empty, since
+  // the remoteButtons/remoteColumns accessors index into it unconditionally
+  ensureRemoteValid();
 
 #ifndef BOARD_CYD
   pinMode(LEARN_BTN_PIN, INPUT_PULLUP);
@@ -3341,6 +3895,14 @@ void setup() {
   server.on("/remote/move", handleRemoteMove);
   server.on("/remote/reorder", handleRemoteReorder);
   server.on("/remote/columns", handleRemoteColumns);
+  server.on("/remote/addmany", handleRemoteAddMany);
+  server.on("/remote/learn", handleRemoteLearnButton);
+  server.on("/remote/teachall", handleRemoteTeachAll);
+  server.on("/remote/teachstop", handleRemoteTeachStop);
+  server.on("/remotes/add", handleRemotesAdd);
+  server.on("/remotes/select", handleRemotesSelect);
+  server.on("/remotes/rename", handleRemotesRename);
+  server.on("/remotes/delete", handleRemotesDelete);
   server.on("/trylookup", handleTryLookup);
   server.on("/savelookupcode", handleSaveLookupCode);
 #ifdef BOARD_CYD
@@ -3383,13 +3945,37 @@ void loop() {
         slotCodeName[pendingLearnSlot] = pendingLearnName;
         pendingLearnSlot = -1;
       }
+      // learning straight into a remote button: save and assign in one go
+      if (pendingLearnRemote >= 0 && pendingLearnButton >= 0 &&
+          pendingLearnRemote < (int)remotes.size() &&
+          pendingLearnButton < (int)remotes[pendingLearnRemote].buttons.size()) {
+        remotes[pendingLearnRemote].buttons[pendingLearnButton].codeName = pendingLearnName;
+      }
+      pendingLearnRemote = -1;
+      pendingLearnButton = -1;
       updateScreen("Learned: " + pendingLearnName);
       markProfileDirty();
       flashLeds(CRGB::Green, 200);
       learning = false;
       pendingLearnName = "";
+
+      // teach-all: immediately arm the next untaught button, so a whole
+      // remote can be taught in one pass without touching the app between
+      // presses
+      bool advanced = false;
+      if (teachAllActive) {
+        int next = nextUntaughtButton(0);
+        if (next >= 0) {
+          advanced = startButtonLearn(next);
+        }
+        if (!advanced) {
+          teachAllActive = false;
+          updateScreen("Teach all: done");
+        }
+      }
 #ifdef BOARD_CYD
-      if (currentCydScreen == CYD_LEARN) cydShowScreen(CYD_HOME);
+      if (currentCydScreen == CYD_LEARN && !advanced) cydShowScreen(CYD_HOME);
+      else if (advanced) cydDrawLearn();
 #endif
     } else {
       // not learning - just note that a signal came in
@@ -3426,10 +4012,19 @@ void loop() {
   // screen/LEDs sit showing "waiting for signal" indefinitely
   if (learning && millis() - learningStartedAt > LEARN_TIMEOUT_MS) {
     Serial.println("Learn timed out waiting for a signal");
-    updateScreen("Learn timed out");
     learning = false;
     pendingLearnName = "";
     pendingLearnSlot = -1;
+    pendingLearnRemote = -1;
+    pendingLearnButton = -1;
+    // a timeout ends the whole teach-all run - otherwise walking away
+    // mid-way would leave it armed and it would grab the next stray signal
+    if (teachAllActive) {
+      teachAllActive = false;
+      updateScreen("Teach all stopped (timeout)");
+    } else {
+      updateScreen("Learn timed out");
+    }
 #ifdef BOARD_CYD
     if (currentCydScreen == CYD_LEARN) cydShowScreen(CYD_HOME);
 #endif
