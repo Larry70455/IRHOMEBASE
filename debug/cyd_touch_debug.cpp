@@ -296,9 +296,19 @@ void applyRotation() {
   Serial.printf("rotation=%u  display=%dx%d\n", rotation, tft.width(), tft.height());
 }
 
+bool anyKeyReceived = false;
+
 void handleSerial() {
   while (Serial.available()) {
     char c = (char)Serial.read();
+    // Report every byte that arrives, before any filtering. If keys look
+    // dead, this distinguishes "nothing is reaching the board" (nothing
+    // prints) from "the byte arrived but wasn't understood".
+    if (!anyKeyReceived) {
+      anyKeyReceived = true;
+      Serial.println(">>> serial input is working <<<");
+    }
+    Serial.printf("[rx 0x%02X '%c']\n", (uint8_t)c, (c >= 32 && c < 127) ? c : '?');
     if (c == '\r' || c == '\n' || c == ' ') continue;
     switch (c) {
       case 'h': printHelp(); break;
@@ -353,6 +363,17 @@ void setup() {
 
 void loop() {
   handleSerial();
+
+  // Proves the sketch is alive and polling serial. Stops permanently as
+  // soon as any byte arrives, so it can't become spam - if this keeps
+  // printing, the board is running fine and the keystrokes are not
+  // reaching it (wrong terminal focus, port held by another program, or
+  // the monitor attached to a different env).
+  static unsigned long lastNag = 0;
+  if (!anyKeyReceived && millis() - lastNag > 10000) {
+    lastNag = millis();
+    Serial.println("[alive, listening for a key - press 'h']");
+  }
 
   int x, y;
   if (mapTouch(x, y)) {
