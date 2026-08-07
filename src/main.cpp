@@ -2832,6 +2832,39 @@ void cydHandleTouchPoll() {
   }
 }
 
+// Touch calibration doesn't need to run every boot - save whatever
+// calibrateTouch() produces once, and load it back on subsequent boots via
+// setTouchCalibrate() (LGFX's "apply already-known calibration" companion
+// to calibrateTouch()) instead of re-running the interactive crosshair UI.
+#define CYD_CALIB_PATH "/cyd_touch_calib.bin"
+
+bool cydLoadTouchCalib(uint16_t *calibData) {
+  if (!LittleFS.exists(CYD_CALIB_PATH)) return false;
+  File f = LittleFS.open(CYD_CALIB_PATH, "r");
+  if (!f) return false;
+  size_t n = f.read((uint8_t*)calibData, sizeof(uint16_t) * 8);
+  f.close();
+  return n == sizeof(uint16_t) * 8;
+}
+
+void cydSaveTouchCalib(const uint16_t *calibData) {
+  File f = LittleFS.open(CYD_CALIB_PATH, "w");
+  if (!f) return;
+  f.write((const uint8_t*)calibData, sizeof(uint16_t) * 8);
+  f.close();
+}
+
+// /cydrecalibrate - clears the saved calibration and reboots into the
+// interactive crosshair UI again. Useful after changing CYD_ROTATION (old
+// calibration data doesn't necessarily still line up) or if touch just
+// starts feeling off.
+void handleCydRecalibrate() {
+  LittleFS.remove(CYD_CALIB_PATH);
+  server.send(200, "text/plain", "Calibration cleared - rebooting to recalibrate. Point at the crosshairs on the screen after it restarts.");
+  delay(300);
+  ESP.restart();
+}
+
 #endif  // BOARD_CYD
 
 void setup() {
@@ -2861,19 +2894,28 @@ void setup() {
 #endif
 
   tft.init();
+#ifdef BOARD_CYD
+  tft.setRotation(CYD_ROTATION);  // adjust this constant in LGX_Config_CYD.h if the display looks mirrored/rotated wrong
+#else
   tft.setRotation(0);
+#endif
   tft.setTextWrap(false);  // all text is measured/truncated manually - never let the library wrap
   tft.setBrightness(SCREEN_BRIGHTNESS);
   tft.fillScreen(TFT_BLACK);
 
 #ifdef BOARD_CYD
-  // One-time interactive touch calibration (crosshairs, tap to confirm) -
-  // not persisted to flash, so this runs fresh every boot. Uses LGFX's
-  // built-in helper rather than a hand-rolled 2-point tap UI. Blocking, but
-  // only here at boot - same as the WiFi-connect-retry loop below - loop()
-  // itself stays fully non-blocking.
+  // Touch calibration: load a previously-saved result if there is one:
+  // interactive crosshairs (LGFX's built-in helper, not a hand-rolled
+  // 2-point tap UI) only run on the very first boot, or after /cydrecalibrate
+  // clears the saved file. Blocking, but only here at boot - same as the
+  // WiFi-connect-retry loop below - loop() itself stays fully non-blocking.
   uint16_t cydCalibData[8];
-  tft.calibrateTouch(cydCalibData, TFT_WHITE, TFT_BLACK, 20);
+  if (!cydLoadTouchCalib(cydCalibData)) {
+    tft.calibrateTouch(cydCalibData, TFT_WHITE, TFT_BLACK, 20);
+    cydSaveTouchCalib(cydCalibData);
+  } else {
+    tft.setTouchCalibrate(cydCalibData);
+  }
 #endif
 
   updateScreen("Booting...");
@@ -2925,6 +2967,9 @@ void setup() {
   server.on("/remote/columns", handleRemoteColumns);
   server.on("/trylookup", handleTryLookup);
   server.on("/savelookupcode", handleSaveLookupCode);
+#ifdef BOARD_CYD
+  server.on("/cydrecalibrate", handleCydRecalibrate);
+#endif
   server.begin();
 
   updateScreen("Ready");
