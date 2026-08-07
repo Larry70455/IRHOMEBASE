@@ -377,7 +377,11 @@ int SCREEN_H = 320;
 const uint8_t SCREEN_BRIGHTNESS = 180;
 bool screenAsleep = false;
 unsigned long lastActivityAt = 0;
-const unsigned long SCREENSAVER_TIMEOUT_MS = 120000;  // 2 min idle -> sleep
+// 0 = never sleep, which is the default: on a touchscreen-primary build a
+// blank screen is just an obstacle - you have to wake it before you can
+// use it. Adjustable (and persisted) via /screensleep for anyone who does
+// want the backlight to drop after a while.
+unsigned long screensaverTimeoutMs = 0;
 
 // Trims s until "s..." fits within maxWidth (assumes the current font is
 // already set). Never overflows maxWidth, whatever the font's real metrics.
@@ -748,6 +752,7 @@ bool saveProfile() {
     }
   }
   doc["currentRemote"] = currentRemote;
+  doc["screenSleepMs"] = screensaverTimeoutMs;
 
   // write to a temp file and rename it over the real one rather than
   // writing PROFILE_PATH directly - LittleFS's rename atomically replaces
@@ -904,6 +909,7 @@ bool loadProfile() {
     currentRemote = 0;
   }
   ensureRemoteValid();
+  screensaverTimeoutMs = doc["screenSleepMs"] | 0UL;   // absent (older profile) = never sleep
 
   Serial.printf("loadProfile: loaded %u codes, %u remotes (current '%s', %u buttons)\n",
                 (unsigned)codeLibrary.size(), (unsigned)remotes.size(),
@@ -1165,6 +1171,7 @@ void handleApiState() {
   json += "\"wave\":\"" + colorToHex(waveColor) + "\"";
   json += "},";
 
+  json += "\"screenSleepMin\":" + String((int)(screensaverTimeoutMs / 60000UL)) + ",";
   json += "\"teachAll\":" + String(teachAllActive ? "true" : "false") + ",";
   json += "\"learnButton\":" + String(pendingLearnButton) + ",";
 
@@ -1362,6 +1369,20 @@ static const char PAGE_HTML[] PROGMEM = R"HTML(<!doctype html>
     <input type='color' id='colorWave'>
   </div>
   <p class='empty'>Each physical slot and remote button also has its own color - set those on the Physical/Remote tabs.</p>
+
+  <h3>Screen</h3>
+  <div class='item'>
+    <span class='name'>Sleep after</span>
+    <select id='screenSleepSel'>
+      <option value='0'>Never</option>
+      <option value='1'>1 min</option>
+      <option value='2'>2 min</option>
+      <option value='5'>5 min</option>
+      <option value='10'>10 min</option>
+      <option value='30'>30 min</option>
+    </select>
+  </div>
+  <p class='empty'>Never is the default. If sleep is on, the first tap only wakes the screen - it won't fire whatever button is underneath.</p>
 </div>
 
 <div class='tabPanel' id='tab-backup'>
@@ -1542,6 +1563,9 @@ document.getElementById('importFile').addEventListener('change', async function 
 function setColor(key, hex) { mutate('/setcolors', {[key]: hex}); }
 document.getElementById('colorAccent').addEventListener('change', function () { setColor('accent', this.value); });
 document.getElementById('colorWave').addEventListener('change', function () { setColor('wave', this.value); });
+document.getElementById('screenSleepSel').addEventListener('change', function () {
+  mutate('/screensleep', {minutes: this.value});
+});
 
 document.getElementById('remoteColumnsSel').addEventListener('change', function () {
   mutate('/remote/columns', {n: this.value});
@@ -2089,6 +2113,9 @@ function render(state) {
       if (document.activeElement !== input) input.value = pair[1];
     });
 
+  const sleepSel = document.getElementById('screenSleepSel');
+  if (document.activeElement !== sleepSel) sleepSel.value = String(state.screenSleepMin);
+
   renderRemote(state);
   renderSlots(state);
 
@@ -2352,6 +2379,30 @@ void handleSetColors() {
   if (server.hasArg("accent")) accentColor = parseHexColor(server.arg("accent"), accentColor);
   if (server.hasArg("wave")) waveColor = parseHexColor(server.arg("wave"), waveColor);
   updateScreen(lastStatus);  // redraw now so the new colors are visible immediately
+  markProfileDirty();
+  finishRequest();
+}
+
+// /screensleep?minutes=N - 0 means never blank the backlight (the default)
+void handleScreenSleep() {
+  if (!server.hasArg("minutes")) {
+    server.send(400, "text/plain", "Missing minutes");
+    return;
+  }
+  long m = server.arg("minutes").toInt();
+  if (m < 0 || m > 240) {
+    server.send(400, "text/plain", "minutes must be 0-240 (0 = never)");
+    return;
+  }
+  screensaverTimeoutMs = (unsigned long)m * 60000UL;
+  // waking here matters: setting it to "never" while the screen is already
+  // blanked would otherwise leave it dark with nothing left to re-trigger
+  // the wake path
+  if (screenAsleep) {
+    screenAsleep = false;
+    tft.setBrightness(SCREEN_BRIGHTNESS);
+  }
+  lastActivityAt = millis();
   markProfileDirty();
   finishRequest();
 }
@@ -3725,6 +3776,18 @@ void cydHandleTouchPoll() {
   if (!cydReadRawTouch(rx, ry)) return;
   lastCydTouchAt = millis();
 
+  // A tap on a blanked screen wakes it and nothing else. Without this the
+  // wake-up tap also lands on whatever button happens to be under it and
+  // fires that code - you can't see what you're pressing, so it would be
+  // firing something at random. (Only reachable when the screensaver has
+  // been turned on; it's off by default.)
+  if (screenAsleep) {
+    screenAsleep = false;
+    lastActivityAt = millis();
+    tft.setBrightness(SCREEN_BRIGHTNESS);
+    return;
+  }
+
   // raw ADC -> screen, using the ranges measured on this hardware
   long x = map(rx, CYD_RAW_X_MIN, CYD_RAW_X_MAX, 0, SCREEN_W - 1);
   long y = map(ry, CYD_RAW_Y_MIN, CYD_RAW_Y_MAX, 0, SCREEN_H - 1);
@@ -3889,6 +3952,7 @@ void setup() {
   server.on("/import", HTTP_POST, handleImport);
   server.on("/assignslot", handleAssignSlot);
   server.on("/setcolors", handleSetColors);
+  server.on("/screensleep", handleScreenSleep);
   server.on("/remote/add", handleRemoteAdd);
   server.on("/remote/update", handleRemoteUpdate);
   server.on("/remote/delete", handleRemoteDelete);
@@ -4075,11 +4139,12 @@ void loop() {
     saveProfile();
   }
 
-  // screensaver: blank the backlight after idle. Any updateScreen() call
-  // (button press, blast, learn, WiFi status change, ...) counts as
-  // activity and wakes it - see updateScreen(). Web polling does NOT count,
-  // since /api/state alone doesn't call updateScreen().
-  if (!screenAsleep && millis() - lastActivityAt > SCREENSAVER_TIMEOUT_MS) {
+  // screensaver: blank the backlight after idle, only if enabled at all.
+  // Any updateScreen() call (button press, blast, learn, WiFi status
+  // change, ...) counts as activity and wakes it - see updateScreen(). Web
+  // polling does NOT count, since /api/state alone doesn't call it.
+  if (screensaverTimeoutMs && !screenAsleep &&
+      millis() - lastActivityAt > screensaverTimeoutMs) {
     screenAsleep = true;
     tft.setBrightness(0);
   }
