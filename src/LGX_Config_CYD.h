@@ -9,18 +9,22 @@
 //
 // That same reference project's own TFT_eSPI config uses ILI9341_2_DRIVER,
 // not the plain ILI9341 driver - a known alternate init sequence some
-// cheap ILI9341 clone panels need. LovyanGFX doesn't expose a matching
-// "_2" toggle, and I have no hardware to determine the exact equivalent
-// register-level fix, so instead of guessing blind again: rotation/mirror
-// is made trivially adjustable right here. If text/UI looks mirrored,
-// upside-down, or calibration only draws over part of the screen, change
-// CYD_ROTATION below (try 1, then 2, then 3) and re-flash - one line, no
-// need to touch anything else. The 4 values cover every mirror/rotation
-// combination this display driver supports, so one of them should be
-// correct. If touch lands in the wrong place relative to where you
-// actually tap even after the display looks right, CYD_TOUCH_ROTATION is
-// the equivalent knob for the touch controller - try it independently,
-// it doesn't always match CYD_ROTATION.
+// cheap ILI9341 clone panels need. I pulled TFT_eSPI's actual init tables
+// for both drivers to see the real difference rather than guess: the "_2"
+// variant sends a fixed MADCTL of 0x08 (bit3 = BGR color order, every
+// other bit - row/column mirror, row/column swap - left at 0) instead of
+// computing MADCTL per-rotation the way the standard driver (and
+// LovyanGFX's stock Panel_ILI9341) does. Two concrete, evidence-based
+// consequences:
+//  1. rgb_order is BGR (true), not RGB - set below. This part is no
+//     longer a guess.
+//  2. Since MADCTL's mirror/swap bits are unverified for this specific
+//     clone (LovyanGFX has no raw-MADCTL override to match TFT_eSPI's
+//     fixed 0x08 exactly), CYD_ROTATION below stays the adjustable
+//     fallback for mirrored/rotated/partially-updating display - cycle
+//     0/1/2/3 and re-flash. CYD_TOUCH_ROTATION is the equivalent knob for
+//     touch coordinates, adjustable independently since it doesn't always
+//     match CYD_ROTATION.
 #define CYD_ROTATION 0
 #define CYD_TOUCH_ROTATION 0
 
@@ -63,7 +67,7 @@ public:
       cfg.offset_y         = 0;
       cfg.offset_rotation  = CYD_ROTATION;
       cfg.invert           = false;  // ILI9341 - unlike the other board's ST7789, no invert needed. Flip this too if colors look inverted once orientation is fixed.
-      cfg.rgb_order        = false;
+      cfg.rgb_order        = true;   // this board's clone panel init sets the BGR bit - see the comment above
       _panel_instance.config(cfg);
     }
 

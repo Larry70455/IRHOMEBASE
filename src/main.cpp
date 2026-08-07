@@ -2832,6 +2832,39 @@ void cydHandleTouchPoll() {
   }
 }
 
+// One-time visual diagnostic, shown right before the very first
+// calibration: four colored, labeled quadrants plus a white border drawn
+// at exactly the declared screen extent (0,0)-(SCREEN_W-1,SCREEN_H-1). If
+// the real panel is a different resolution than assumed, or mirrored, or
+// only partially addressable, this makes it visible in one look instead of
+// guessing config values one at a time - e.g. if the border doesn't reach
+// a physical edge, that edge's dimension is wrong; if "TL" shows up in a
+// different physical corner than top-left, that's the rotation/mirror to
+// fix; a quadrant that stays whatever color it was before (not updating)
+// is the "partial screen doesn't clear" symptom, localized to a specific
+// corner instead of a vague fraction.
+void cydRunDiagnostic() {
+  tft.startWrite();
+  int halfW = SCREEN_W / 2, halfH = SCREEN_H / 2;
+  tft.fillRect(0, 0, halfW, halfH, TFT_RED);
+  tft.fillRect(halfW, 0, SCREEN_W - halfW, halfH, TFT_GREEN);
+  tft.fillRect(0, halfH, halfW, SCREEN_H - halfH, TFT_BLUE);
+  tft.fillRect(halfW, halfH, SCREEN_W - halfW, SCREEN_H - halfH, TFT_YELLOW);
+  tft.drawRect(0, 0, SCREEN_W, SCREEN_H, TFT_WHITE);
+  tft.drawRect(1, 1, SCREEN_W - 2, SCREEN_H - 2, TFT_WHITE);  // doubled so a 1px border is easy to spot
+  tft.setFont(&fonts::FreeSansBold9pt7b);
+  tft.setTextColor(TFT_WHITE, TFT_RED);
+  tft.drawString("TOP-LEFT", 6, 6);
+  tft.setTextColor(TFT_WHITE, TFT_GREEN);
+  tft.drawString("TOP-RIGHT", SCREEN_W - 74, 6);
+  tft.setTextColor(TFT_WHITE, TFT_BLUE);
+  tft.drawString("BOTTOM-LEFT", 6, SCREEN_H - 24);
+  tft.setTextColor(TFT_WHITE, TFT_YELLOW);
+  tft.drawString("BOTTOM-RIGHT", SCREEN_W - 90, SCREEN_H - 24);
+  tft.endWrite();
+  delay(6000);  // watchdog isn't armed yet at this point in setup() - safe to block here
+}
+
 // Touch calibration doesn't need to run every boot - save whatever
 // calibrateTouch() produces once, and load it back on subsequent boots via
 // setTouchCalibrate() (LGFX's "apply already-known calibration" companion
@@ -2924,6 +2957,7 @@ void setup() {
   // retry loop below does).
   uint16_t cydCalibData[8];
   if (!cydLoadTouchCalib(cydCalibData)) {
+    cydRunDiagnostic();
     tft.calibrateTouch(cydCalibData, TFT_WHITE, TFT_BLACK, 20);
     cydSaveTouchCalib(cydCalibData);
   } else {
