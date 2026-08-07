@@ -40,9 +40,16 @@
 // compose (offset_rotation is a baked-in pre-rotation, setRotation() is
 // added on top), so driving both off the same constant would have doubled
 // up and only reached half the possible states.
+// Both of these are only the power-on DEFAULTS now - the on-device
+// Settings screen changes them live and saves the result, so neither
+// normally needs editing here.
 #define CYD_ROTATION 4
-// Touch: same 0-7 convention. Leave this alone until the DISPLAY is
-// correct - only then does a mismatch here mean anything.
+// Touch axis fix, applied in software by cydTransformTouch() in main.cpp
+// (bit0 = invert X, bit1 = invert Y, bit2 = swap X/Y). The panel's own
+// touch offset_rotation below is left at 0 so this is the single place
+// that controls touch orientation - two independent corrections applied to
+// the same coordinates would just fight each other. Only needed if taps
+// land somewhere other than where you actually press.
 #define CYD_TOUCH_ROTATION 0
 
 #define LGFX_USE_V1
@@ -124,7 +131,7 @@ public:
       cfg.spi_host = HSPI_HOST;
       cfg.freq = 1000000;
       cfg.bus_shared = false;
-      cfg.offset_rotation = CYD_TOUCH_ROTATION;
+      cfg.offset_rotation = 0;  // fixed - touch orientation is handled by cydTransformTouch() in main.cpp, see above
       _touch_instance.config(cfg);
       _panel_instance.setTouch(&_touch_instance);
     }

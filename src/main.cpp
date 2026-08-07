@@ -350,12 +350,20 @@ void queueCodeSend(const String &name) {
 }
 
 // ---------- screen / LEDs ----------
-// Panel is 240x320 portrait (see LGX_Config.h). Every piece of text below is
-// measured with textWidth() and truncated to fit its box before drawing -
-// deliberately not relying on the library's own word-wrap, so nothing can
-// ever run off the edge of the panel regardless of exact font metrics.
-const int SCREEN_W = 240;
-const int SCREEN_H = 320;
+// Every piece of text below is measured with textWidth() and truncated to
+// fit its box before drawing - deliberately not relying on the library's
+// own word-wrap, so nothing can ever run off the edge of the panel
+// regardless of exact font metrics.
+//
+// These are seeded with the portrait default but overwritten in setup()
+// from tft.width()/tft.height() once the rotation is applied - they are
+// NOT constants. Hardcoding them meant that any rotation which swapped the
+// axes (or any panel not exactly 240x320) left every layout computing
+// against the wrong extent, which is what left part of the screen never
+// being drawn to. Deriving them from the panel is correct for both boards
+// and for all 8 rotation values.
+int SCREEN_W = 240;
+int SCREEN_H = 320;
 const uint8_t SCREEN_BRIGHTNESS = 180;
 bool screenAsleep = false;
 unsigned long lastActivityAt = 0;
@@ -2567,7 +2575,7 @@ void initWatchdog() {
 
 const int CYD_BANNER_H = 50;  // persistent status strip, shared across every CYD screen
 
-enum CydScreen { CYD_HOME, CYD_LEARN };
+enum CydScreen { CYD_HOME, CYD_LEARN, CYD_SETTINGS };
 CydScreen currentCydScreen = CYD_HOME;
 
 struct TapZone {
@@ -2587,10 +2595,86 @@ const int CYD_ACTION_LEARN_NEW = -2;
 const int CYD_ACTION_CANCEL_LEARN = -3;
 const int CYD_ACTION_PAGE_PREV = -4;
 const int CYD_ACTION_PAGE_NEXT = -5;
+const int CYD_ACTION_SETTINGS = -6;
+const int CYD_ACTION_BACK_HOME = -7;
+const int CYD_ACTION_ROT_NEXT = -8;
+const int CYD_ACTION_ROT_PREV = -9;
+const int CYD_ACTION_TROT_NEXT = -10;
+const int CYD_ACTION_TROT_PREV = -11;
+const int CYD_ACTION_RECALIBRATE = -12;
 
 int cydHomePage = 0;
 const int CYD_COLS_MAX = 4;      // wider remoteColumns settings get clamped here for legibility - the full column count still applies on the web Remote tab
 const int CYD_ROWS_PER_PAGE = 3;
+const int CYD_MIN_CELL = 40;     // below this a tile is too small to reliably hit - row/col counts get reduced rather than letting tiles collide
+
+// ---------- runtime display settings ----------
+// Orientation lives here (not just the compile-time CYD_ROTATION default)
+// so it can be changed from the on-device Settings screen and survive a
+// reboot - getting this wrong previously meant a full re-flash per attempt,
+// which is a terrible way to find the right value. Stored in its own file
+// rather than profile.json deliberately: this is per-unit hardware config,
+// and it must NOT travel with a profile export/import between boards.
+uint8_t cydRotation = CYD_ROTATION;
+uint8_t cydTouchRotation = CYD_TOUCH_ROTATION;
+#define CYD_DISPLAY_PATH "/cyd_display.bin"
+// Defined up here rather than beside its helpers further down: the
+// Settings screen's "Recalibrate" action references it, and that code
+// comes first in the file.
+#define CYD_CALIB_PATH "/cyd_touch_calib.bin"
+
+bool cydLoadDisplaySettings() {
+  if (!LittleFS.exists(CYD_DISPLAY_PATH)) return false;
+  File f = LittleFS.open(CYD_DISPLAY_PATH, "r");
+  if (!f) return false;
+  uint8_t buf[2];
+  size_t n = f.read(buf, 2);
+  f.close();
+  if (n != 2 || buf[0] > 7 || buf[1] > 7) return false;  // corrupt/garbage - fall back to the compile-time defaults
+  cydRotation = buf[0];
+  cydTouchRotation = buf[1];
+  return true;
+}
+
+void cydSaveDisplaySettings() {
+  File f = LittleFS.open(CYD_DISPLAY_PATH, "w");
+  if (!f) return;
+  uint8_t buf[2] = { cydRotation, cydTouchRotation };
+  f.write(buf, 2);
+  f.close();
+}
+
+// Applies the current rotation AND re-reads the panel's resulting extent.
+// SCREEN_W/H must be refreshed here rather than assumed: rotations 1/3/5/7
+// swap the axes, so a stale 240x320 would leave part of the panel never
+// drawn to.
+void cydApplyRotation() {
+  tft.setRotation(cydRotation);
+  SCREEN_W = tft.width();
+  SCREEN_H = tft.height();
+}
+
+// Touch axis correction, applied to the coordinates LGFX hands back rather
+// than by reconfiguring the touch driver at runtime. Deliberate choice:
+// the library's runtime touch-reconfig API isn't something I could confirm
+// the exact shape of, and guessing wrong there is a compile error you'd be
+// stuck waiting on. This is plain arithmetic - verifiable by reading it,
+// and it covers the same 8 orientations:
+//   bit 0 = invert X, bit 1 = invert Y, bit 2 = swap X/Y
+// Only needed when the touch layer's physical orientation disagrees with
+// the display's; setRotation() already keeps them aligned in the normal
+// case, so 0 is correct unless taps land somewhere other than where you
+// press.
+void cydTransformTouch(int &x, int &y) {
+  uint8_t r = cydTouchRotation;
+  if (r & 4) { int t = x; x = y; y = t; }
+  if (r & 1) x = SCREEN_W - 1 - x;
+  if (r & 2) y = SCREEN_H - 1 - y;
+  if (x < 0) x = 0;
+  if (y < 0) y = 0;
+  if (x >= SCREEN_W) x = SCREEN_W - 1;
+  if (y >= SCREEN_H) y = SCREEN_H - 1;
+}
 
 // Draws just the persistent banner strip - called on every updateScreen(),
 // so it stays cheap (partial redraw) rather than touching the rest of
@@ -2636,90 +2720,160 @@ void cydShowScreen(CydScreen s);  // forward-referenced by cydHandleTouch() belo
 // the web Remote tab edits), tap a tile to fire it, paged if more tiles
 // exist than fit. Spacers render as a real gap (no tile, no tap zone),
 // matching how the web Remote builder treats them.
+// Shared button painter - every tappable control on every CYD screen goes
+// through this, so label centering/truncation/registration can't drift
+// between screens or be forgotten on one of them.
+void cydDrawButton(int x, int y, int w, int h, const String &label, uint16_t bg, uint16_t fg, int action) {
+  tft.fillRoundRect(x, y, w, h, 8, bg);
+  tft.setFont(&fonts::FreeSansBold9pt7b);
+  tft.setTextDatum(textdatum_t::middle_center);
+  tft.setTextColor(fg, bg);
+  tft.drawString(truncateToWidth(label, w - 10), x + w / 2, y + h / 2);
+  tft.setTextDatum(textdatum_t::top_left);
+  cydAddZone(x, y, w, h, action);
+}
+
 void cydDrawHome() {
   cydZoneCount = 0;
   tft.startWrite();
   tft.fillScreen(TFT_BLACK);
   cydDrawStatusBar(lastStatus);
 
+  const int pad = 8, gap = 6, rowH = 44;
+
+  // Lay the fixed rows out from the bottom up first, then give the grid
+  // whatever vertical space is actually left. Rows are stacked, never
+  // overlaid, so no two controls can collide regardless of screen size -
+  // the previous version packed paging and "Learn New" into one row with
+  // hand-computed widths, which is what allowed them to overlap.
+  int footerY = SCREEN_H - pad - rowH;
+
   int cols = remoteColumns;
   if (cols < 1) cols = 1;
   if (cols > CYD_COLS_MAX) cols = CYD_COLS_MAX;
-  int perPage = cols * CYD_ROWS_PER_PAGE;
+  // shrink the column count rather than let tiles get too small to hit
+  while (cols > 1 && (SCREEN_W - 2 * pad - (cols - 1) * gap) / cols < CYD_MIN_CELL) cols--;
+
+  int rows = CYD_ROWS_PER_PAGE;
+  int perPage = cols * rows;
   int totalPages = max(1, (int)((remoteButtons.size() + perPage - 1) / perPage));
+
+  int pagingY = -1;
+  if (totalPages > 1) {
+    pagingY = footerY - gap - rowH;
+  }
+  int gridTop = CYD_BANNER_H + pad;
+  int gridBottom = (pagingY > 0 ? pagingY : footerY) - gap;
+  int gridH = gridBottom - gridTop;
+
+  // same guard vertically: fewer rows beats unusably short tiles
+  while (rows > 1 && (gridH - (rows - 1) * gap) / rows < CYD_MIN_CELL) rows--;
+  perPage = cols * rows;
+  totalPages = max(1, (int)((remoteButtons.size() + perPage - 1) / perPage));
   if (cydHomePage >= totalPages) cydHomePage = totalPages - 1;
   if (cydHomePage < 0) cydHomePage = 0;
 
-  int gridTop = CYD_BANNER_H + 8;
-  int footerH = 54;
-  int gridH = SCREEN_H - gridTop - footerH - 8;
-  int gap = 6;
-  int cellW = (SCREEN_W - 16 - (cols - 1) * gap) / cols;
-  int cellH = (gridH - (CYD_ROWS_PER_PAGE - 1) * gap) / CYD_ROWS_PER_PAGE;
+  int cellW = (SCREEN_W - 2 * pad - (cols - 1) * gap) / cols;
+  int cellH = (gridH - (rows - 1) * gap) / rows;
 
-  int start = cydHomePage * perPage;
-  int end = min((int)remoteButtons.size(), start + perPage);
-  for (int i = start; i < end; i++) {
-    int slot = i - start;
-    int col = slot % cols;
-    int row = slot / cols;
-    int x = 8 + col * (cellW + gap);
-    int y = gridTop + row * (cellH + gap);
-    RemoteButton &b = remoteButtons[i];
-    if (b.spacer) continue;  // invisible placeholder - real gap, no tile
-
-    uint16_t bg565 = tft.color565(b.color.r, b.color.g, b.color.b);
-    uint16_t textColor = contrastTextColor(b.color);
-    tft.fillRoundRect(x, y, cellW, cellH, 8, bg565);
-    if (b.icon != ICON_NONE) {
-      drawIcon(b.icon, x, y, cellW, cellH, textColor);
-    } else {
-      tft.setFont(&fonts::FreeSansBold9pt7b);
-      tft.setTextDatum(textdatum_t::middle_center);
-      tft.setTextColor(textColor, bg565);
-      String label = b.name.length() ? b.name : b.codeName;
-      tft.drawString(truncateToWidth(label, cellW - 8), x + cellW / 2, y + cellH / 2);
-      tft.setTextDatum(textdatum_t::top_left);
-    }
-    cydAddZone(x, y, cellW, cellH, i);
-  }
-
-  if (remoteButtons.size() == 0) {
+  if (remoteButtons.empty()) {
     tft.setFont(&fonts::FreeSans9pt7b);
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
     tft.setTextDatum(textdatum_t::middle_center);
-    tft.drawString("No remote buttons yet -", SCREEN_W / 2, SCREEN_H / 2 - 12);
-    tft.drawString("add some from the web app.", SCREEN_W / 2, SCREEN_H / 2 + 12);
+    tft.drawString("No remote buttons yet -", SCREEN_W / 2, gridTop + gridH / 2 - 12);
+    tft.drawString("add them in the web app.", SCREEN_W / 2, gridTop + gridH / 2 + 12);
     tft.setTextDatum(textdatum_t::top_left);
+  } else if (cellH >= CYD_MIN_CELL) {
+    int start = cydHomePage * perPage;
+    int end = min((int)remoteButtons.size(), start + perPage);
+    for (int i = start; i < end; i++) {
+      int slot = i - start;
+      int x = pad + (slot % cols) * (cellW + gap);
+      int y = gridTop + (slot / cols) * (cellH + gap);
+      RemoteButton &b = remoteButtons[i];
+      if (b.spacer) continue;  // invisible placeholder - real gap, no tile
+
+      uint16_t bg565 = tft.color565(b.color.r, b.color.g, b.color.b);
+      uint16_t textColor = contrastTextColor(b.color);
+      tft.fillRoundRect(x, y, cellW, cellH, 8, bg565);
+      if (b.icon != ICON_NONE) {
+        drawIcon(b.icon, x, y, cellW, cellH, textColor);
+      } else {
+        tft.setFont(&fonts::FreeSansBold9pt7b);
+        tft.setTextDatum(textdatum_t::middle_center);
+        tft.setTextColor(textColor, bg565);
+        String label = b.name.length() ? b.name : b.codeName;
+        tft.drawString(truncateToWidth(label, cellW - 8), x + cellW / 2, y + cellH / 2);
+        tft.setTextDatum(textdatum_t::top_left);
+      }
+      cydAddZone(x, y, cellW, cellH, i);
+    }
   }
 
-  // footer: paging (only if needed) + Learn New
-  int footerY = SCREEN_H - footerH;
-  tft.setFont(&fonts::FreeSansBold9pt7b);
-  tft.setTextDatum(textdatum_t::middle_center);
-  int learnX = 8;
-  int learnW = SCREEN_W - 16;
-  if (totalPages > 1) {
-    int navW = 60;
-    tft.fillRoundRect(8, footerY, navW, footerH - 8, 8, TFT_DARKGREY);
-    tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
-    tft.drawString("<", 8 + navW / 2, footerY + (footerH - 8) / 2);
-    cydAddZone(8, footerY, navW, footerH - 8, CYD_ACTION_PAGE_PREV);
-
-    tft.fillRoundRect(SCREEN_W - 8 - navW, footerY, navW, footerH - 8, 8, TFT_DARKGREY);
-    tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
-    tft.drawString(">", SCREEN_W - 8 - navW / 2, footerY + (footerH - 8) / 2);
-    cydAddZone(SCREEN_W - 8 - navW, footerY, navW, footerH - 8, CYD_ACTION_PAGE_NEXT);
-
-    learnX = 8 + navW + 8;
-    learnW = SCREEN_W - 16 - 2 * (navW + 8);
+  // paging row (own row, only when there's more than one page)
+  if (pagingY > 0) {
+    int navW = (SCREEN_W - 2 * pad - gap) / 2;
+    cydDrawButton(pad, pagingY, navW, rowH, "< Prev", TFT_DARKGREY, TFT_WHITE, CYD_ACTION_PAGE_PREV);
+    cydDrawButton(pad + navW + gap, pagingY, navW, rowH, "Next >", TFT_DARKGREY, TFT_WHITE, CYD_ACTION_PAGE_NEXT);
   }
+
+  // footer row: Learn New + Settings, split evenly
   uint16_t accent565 = tft.color565(accentColor.r, accentColor.g, accentColor.b);
-  tft.fillRoundRect(learnX, footerY, learnW, footerH - 8, 8, accent565);
-  tft.setTextColor(contrastTextColor(accentColor), accent565);
-  tft.drawString("Learn New", learnX + learnW / 2, footerY + (footerH - 8) / 2);
-  cydAddZone(learnX, footerY, learnW, footerH - 8, CYD_ACTION_LEARN_NEW);
+  int halfW = (SCREEN_W - 2 * pad - gap) / 2;
+  cydDrawButton(pad, footerY, halfW, rowH, "Learn New", accent565, contrastTextColor(accentColor), CYD_ACTION_LEARN_NEW);
+  cydDrawButton(pad + halfW + gap, footerY, halfW, rowH, "Settings", TFT_NAVY, TFT_WHITE, CYD_ACTION_SETTINGS);
+
+  tft.endWrite();
+}
+
+// Settings: on-device display/touch configuration. Exists specifically so
+// orientation can be corrected without a re-flash - stepping a value here
+// applies it live and saves it, so a wrong guess costs one tap instead of
+// a full build/upload cycle.
+void cydDrawSettings() {
+  cydZoneCount = 0;
+  tft.startWrite();
+  tft.fillScreen(TFT_BLACK);
+  cydDrawStatusBar("Settings");
+
+  const int pad = 8, gap = 6, rowH = 40, stepW = 52;
+  int y = CYD_BANNER_H + pad;
+
+  tft.setFont(&fonts::FreeSans9pt7b);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setTextDatum(textdatum_t::top_left);
+
+  // --- screen rotation ---
+  tft.drawString("Screen rotation (4-7 = mirrored)", pad, y);
+  y += 20;
+  cydDrawButton(pad, y, stepW, rowH, "<", TFT_DARKGREY, TFT_WHITE, CYD_ACTION_ROT_PREV);
+  tft.setFont(&fonts::FreeSansBold12pt7b);
+  tft.setTextDatum(textdatum_t::middle_center);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString(String(cydRotation), SCREEN_W / 2, y + rowH / 2);
+  tft.setTextDatum(textdatum_t::top_left);
+  cydDrawButton(SCREEN_W - pad - stepW, y, stepW, rowH, ">", TFT_DARKGREY, TFT_WHITE, CYD_ACTION_ROT_NEXT);
+  y += rowH + gap + 6;
+
+  // --- touch rotation ---
+  tft.setFont(&fonts::FreeSans9pt7b);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("Touch fix (only if taps land wrong)", pad, y);
+  y += 20;
+  cydDrawButton(pad, y, stepW, rowH, "<", TFT_DARKGREY, TFT_WHITE, CYD_ACTION_TROT_PREV);
+  tft.setFont(&fonts::FreeSansBold12pt7b);
+  tft.setTextDatum(textdatum_t::middle_center);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString(String(cydTouchRotation), SCREEN_W / 2, y + rowH / 2);
+  tft.setTextDatum(textdatum_t::top_left);
+  cydDrawButton(SCREEN_W - pad - stepW, y, stepW, rowH, ">", TFT_DARKGREY, TFT_WHITE, CYD_ACTION_TROT_NEXT);
+  y += rowH + gap + 10;
+
+  cydDrawButton(pad, y, SCREEN_W - 2 * pad, rowH, "Recalibrate touch", TFT_DARKGREEN, TFT_WHITE, CYD_ACTION_RECALIBRATE);
+
+  // Back pinned to the bottom, not flowed after the rows above, so it's
+  // always reachable even if the rows ever grow.
+  cydDrawButton(pad, SCREEN_H - pad - rowH, SCREEN_W - 2 * pad, rowH, "Back", TFT_NAVY, TFT_WHITE, CYD_ACTION_BACK_HOME);
 
   tft.endWrite();
 }
@@ -2760,6 +2914,8 @@ void cydShowScreen(CydScreen s) {
   if (s == CYD_HOME) {
     cydHomePage = 0;
     cydDrawHome();
+  } else if (s == CYD_SETTINGS) {
+    cydDrawSettings();
   } else {
     cydDrawLearn();
   }
@@ -2775,12 +2931,27 @@ void cydShowLearnScreen() { cydShowScreen(CYD_LEARN); }
 // the web app uses - queueCodeSend() for firing a code, the same
 // pendingLearnName/learning/learningStartedAt setup handleLearn() uses to
 // start a learn - so there's no forked logic, just a different trigger.
+// Immediate visual acknowledgement of a tap. Without this a press that
+// queues a send looks identical to a press that missed, since the actual
+// send is drained a moment later in loop() - the outline is drawn the
+// instant the touch lands, and cydRedrawAt schedules the clean repaint
+// (non-blocking, no delay()).
+unsigned long cydRedrawAt = 0;
+
+void cydFlashZone(const TapZone &z) {
+  tft.drawRect(z.x, z.y, z.w, z.h, TFT_WHITE);
+  tft.drawRect(z.x + 1, z.y + 1, z.w - 2, z.h - 2, TFT_WHITE);
+  cydRedrawAt = millis() + 180;
+}
+
 void cydHandleTouch(int x, int y) {
   for (int i = 0; i < cydZoneCount; i++) {
     TapZone &z = cydZones[i];
     if (x < z.x || x >= z.x + z.w || y < z.y || y >= z.y + z.h) continue;
 
     int action = z.action;
+    cydFlashZone(z);
+
     if (currentCydScreen == CYD_HOME) {
       if (action == CYD_ACTION_LEARN_NEW) {
         pendingLearnName = "button_code_" + String(millis());
@@ -2790,12 +2961,18 @@ void cydHandleTouch(int x, int y) {
         updateScreen("Point remote & press...");
         flashLeds(CRGB::Yellow, 150);
         cydShowScreen(CYD_LEARN);
+        cydRedrawAt = 0;  // screen already replaced - nothing stale to repaint
+      } else if (action == CYD_ACTION_SETTINGS) {
+        cydShowScreen(CYD_SETTINGS);
+        cydRedrawAt = 0;
       } else if (action == CYD_ACTION_PAGE_PREV) {
         cydHomePage--;
         cydDrawHome();
+        cydRedrawAt = 0;
       } else if (action == CYD_ACTION_PAGE_NEXT) {
         cydHomePage++;
         cydDrawHome();
+        cydRedrawAt = 0;
       } else if (action >= 0 && action < (int)remoteButtons.size()) {
         const RemoteButton &b = remoteButtons[action];
         if (b.codeName.length() > 0) {
@@ -2812,6 +2989,30 @@ void cydHandleTouch(int x, int y) {
         pendingLearnSlot = -1;
         updateScreen("Learn cancelled");
         cydShowScreen(CYD_HOME);
+        cydRedrawAt = 0;
+      }
+    } else if (currentCydScreen == CYD_SETTINGS) {
+      if (action == CYD_ACTION_BACK_HOME) {
+        cydShowScreen(CYD_HOME);
+        cydRedrawAt = 0;
+      } else if (action == CYD_ACTION_ROT_NEXT || action == CYD_ACTION_ROT_PREV) {
+        cydRotation = (action == CYD_ACTION_ROT_NEXT) ? (cydRotation + 1) & 7
+                                                      : (cydRotation + 7) & 7;
+        cydApplyRotation();       // takes effect immediately, including new SCREEN_W/H
+        cydSaveDisplaySettings(); // ...and survives the next reboot
+        cydDrawSettings();
+        cydRedrawAt = 0;
+      } else if (action == CYD_ACTION_TROT_NEXT || action == CYD_ACTION_TROT_PREV) {
+        cydTouchRotation = (action == CYD_ACTION_TROT_NEXT) ? (cydTouchRotation + 1) & 7
+                                                            : (cydTouchRotation + 7) & 7;
+        cydSaveDisplaySettings();  // no apply step needed - cydTransformTouch() reads the value live
+        cydDrawSettings();
+        cydRedrawAt = 0;
+      } else if (action == CYD_ACTION_RECALIBRATE) {
+        LittleFS.remove(CYD_CALIB_PATH);
+        updateScreen("Rebooting to recalibrate");
+        delay(300);
+        ESP.restart();
       }
     }
     return;  // stop at the first matching zone
@@ -2828,7 +3029,9 @@ void cydHandleTouchPoll() {
   int32_t tx, ty;
   if (tft.getTouch(&tx, &ty)) {
     lastCydTouchAt = millis();
-    cydHandleTouch((int)tx, (int)ty);
+    int x = (int)tx, y = (int)ty;
+    cydTransformTouch(x, y);  // no-op unless the Settings screen's touch-fix value is non-zero
+    cydHandleTouch(x, y);
   }
 }
 
@@ -2869,8 +3072,6 @@ void cydRunDiagnostic() {
 // calibrateTouch() produces once, and load it back on subsequent boots via
 // setTouchCalibrate() (LGFX's "apply already-known calibration" companion
 // to calibrateTouch()) instead of re-running the interactive crosshair UI.
-#define CYD_CALIB_PATH "/cyd_touch_calib.bin"
-
 bool cydLoadTouchCalib(uint16_t *calibData) {
   if (!LittleFS.exists(CYD_CALIB_PATH)) return false;
   File f = LittleFS.open(CYD_CALIB_PATH, "r");
@@ -2932,11 +3133,16 @@ void setup() {
 
   tft.init();
 #ifdef BOARD_CYD
-  // 0-7: 0-3 plain rotations, 4-7 the same but mirrored. Backward text
-  // needs a 4-7 value - see the notes in LGX_Config_CYD.h.
-  tft.setRotation(CYD_ROTATION);
+  // 0-7: 0-3 plain rotations, 4-7 the same but mirrored (backward text
+  // needs a 4-7 value - see the notes in LGX_Config_CYD.h). A value saved
+  // from the on-device Settings screen wins over the compile-time default,
+  // so orientation can be fixed without a re-flash.
+  cydLoadDisplaySettings();
+  cydApplyRotation();      // also refreshes SCREEN_W/SCREEN_H from the panel
 #else
   tft.setRotation(0);
+  SCREEN_W = tft.width();
+  SCREEN_H = tft.height();
 #endif
   tft.setTextWrap(false);  // all text is measured/truncated manually - never let the library wrap
   tft.setBrightness(SCREEN_BRIGHTNESS);
@@ -3133,6 +3339,12 @@ void loop() {
   }
 #else
   cydCheckBannerTintRevert();  // non-blocking counterpart to cydTintBanner() - see CYD screen-manager section
+  // clears the tap-highlight outline once it's been visible long enough
+  if (cydRedrawAt && millis() >= cydRedrawAt) {
+    cydRedrawAt = 0;
+    if (currentCydScreen == CYD_HOME) cydDrawHome();
+    else if (currentCydScreen == CYD_SETTINGS) cydDrawSettings();
+  }
 #endif
 
   // flush a dirty profile to flash after it's settled for a bit, off the
