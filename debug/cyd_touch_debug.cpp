@@ -1,26 +1,23 @@
 // ---------------------------------------------------------------------
-// Standalone CYD touch/display debug sketch.
+// Standalone CYD touch/display debug sketch - interactive.
 //
-//   pio run -e cyd-debug -t upload && pio device monitor -e cyd-debug
+//   pio run -e cyd-debug -t upload
+//   pio device monitor -e cyd-debug
 //
-// Deliberately self-contained: its own display config, its own touch
-// driver, no dependency on src/main.cpp or LGX_Config_CYD.h. If this
-// sketch works, the settings it prints are known-good for the hardware,
-// independent of anything the main firmware is doing.
+// Everything is adjustable live over serial: single-key commands, no
+// re-flashing to try a different combination. Press 'h' for the list.
 //
-// It talks to the XPT2046 touch controller directly over SPI rather than
-// going through the graphics library's touch layer, so nothing here
-// depends on a stored calibration - which is the point, since a bad
-// calibration is exactly what stops you reaching the settings screen in
-// the main firmware.
+// Serial is quiet by default - it prints on command and on state change,
+// not continuously. Per-touch logging is opt-in ('t') and throttled, so
+// the monitor stays readable while you work.
 //
-// What it does:
-//   1. Draws a target in each corner in turn and asks you to tap it.
-//   2. Records the RAW 12-bit values the touch chip reports for each.
-//   3. Prints a summary: the raw ranges, whether the axes are swapped,
-//      whether either is inverted, and the exact values to use.
-//   4. Drops into a free-draw mode using the mapping it just derived, so
-//      you can confirm taps land where you actually press.
+// Deliberately self-contained: its own display config, its own XPT2046
+// driver talking to the chip directly over SPI, no dependency on
+// src/main.cpp or LGX_Config_CYD.h, and no reliance on any stored
+// calibration - a bad stored calibration being what makes the main
+// firmware's own settings screen unreachable in the first place.
+//
+// When the mapping is right, press 'p' and send me that block.
 // ---------------------------------------------------------------------
 #include <Arduino.h>   // map()/constrain()/labs() - included explicitly rather than relying on another header pulling it in
 #define LGFX_USE_V1
@@ -64,6 +61,18 @@ LGFX tft;
 
 SPIClass touchSPI(HSPI);
 
+// ---- live-adjustable state ----
+uint8_t  rotation  = 0;
+bool     swapXY    = false, invX = false, invY = false;
+uint16_t rawXmin   = 300, rawXmax = 3800;
+uint16_t rawYmin   = 300, rawYmax = 3800;
+bool     verbose   = false;   // per-touch serial logging, off by default
+bool     invertDisp = false;
+bool     bgrOrder  = true;
+
+unsigned long lastVerboseAt = 0;
+const unsigned long VERBOSE_MIN_GAP_MS = 250;  // keeps 't' mode readable rather than a flood
+
 // 0xD0 = read X, 0x90 = read Y (12-bit, differential mode)
 uint16_t xptRead(uint8_t cmd) {
   touchSPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
@@ -78,8 +87,8 @@ uint16_t xptRead(uint8_t cmd) {
 
 bool touchDown() { return digitalRead(T_IRQ) == LOW; }
 
-// Median of several reads - the raw values are noisy enough that a single
-// sample can be well off, which would poison the derived mapping.
+// Median of several reads - raw values are noisy enough that a single
+// sample can be well off, which would skew any range derived from it.
 bool readTouch(uint16_t &rx, uint16_t &ry) {
   if (!touchDown()) return false;
   const int N = 9;
@@ -106,10 +115,87 @@ bool readTouch(uint16_t &rx, uint16_t &ry) {
 
 void waitRelease() {
   while (touchDown()) delay(10);
-  delay(120);   // settle, avoids one press registering twice
+  delay(120);   // settle, so one press can't register twice
 }
 
-// ---- calibration capture ----
+bool mapTouch(int &sx, int &sy) {
+  uint16_t rx, ry;
+  if (!readTouch(rx, ry)) return false;
+  uint16_t ax = swapXY ? ry : rx;
+  uint16_t ay = swapXY ? rx : ry;
+  long x = map(ax, rawXmin, rawXmax, 0, tft.width()  - 1);
+  long y = map(ay, rawYmin, rawYmax, 0, tft.height() - 1);
+  if (invX) x = tft.width()  - 1 - x;
+  if (invY) y = tft.height() - 1 - y;
+  sx = constrain(x, 0, tft.width()  - 1);
+  sy = constrain(y, 0, tft.height() - 1);
+  return true;
+}
+
+// ---- screen ----
+void drawUI() {
+  int W = tft.width(), H = tft.height();
+  tft.fillScreen(TFT_BLACK);
+  tft.drawRect(0, 0, W, H, TFT_DARKGREY);
+
+  // reference marks at the exact corners and centre
+  int pts[5][2] = { {0,0}, {W-1,0}, {0,H-1}, {W-1,H-1}, {W/2,H/2} };
+  for (auto &p : pts) {
+    tft.drawLine(p[0]-12, p[1], p[0]+12, p[1], TFT_DARKGREEN);
+    tft.drawLine(p[0], p[1]-12, p[0], p[1]+12, TFT_DARKGREEN);
+  }
+
+  tft.setFont(&fonts::FreeSansBold9pt7b);
+  tft.setTextDatum(textdatum_t::top_center);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  String line = String(W) + "x" + String(H) + " rot" + String(rotation) +
+                (swapXY ? " SWAP" : "") + (invX ? " INVX" : "") + (invY ? " INVY" : "");
+  tft.drawString(line, W / 2, 6);
+  tft.setFont(&fonts::FreeSans9pt7b);
+  tft.drawString("tap = dot under finger", W / 2, 26);
+  tft.setTextDatum(textdatum_t::top_left);
+}
+
+void printConfig() {
+  Serial.println();
+  Serial.println("================ CONFIG ================");
+  Serial.printf("display        : %d x %d\n", tft.width(), tft.height());
+  Serial.printf("rotation       : %u\n", rotation);
+  Serial.printf("panel invert   : %s\n", invertDisp ? "true" : "false");
+  Serial.printf("rgb_order BGR  : %s\n", bgrOrder ? "true" : "false");
+  Serial.printf("axes swapped   : %s\n", swapXY ? "true" : "false");
+  Serial.printf("invert X       : %s\n", invX ? "true" : "false");
+  Serial.printf("invert Y       : %s\n", invY ? "true" : "false");
+  Serial.printf("raw X range    : %u .. %u\n", rawXmin, rawXmax);
+  Serial.printf("raw Y range    : %u .. %u\n", rawYmin, rawYmax);
+  Serial.println("========================================");
+  Serial.println("When taps land correctly, send this block back.");
+  Serial.println();
+}
+
+void printHelp() {
+  Serial.println();
+  Serial.println("---------------- KEYS ------------------");
+  Serial.println("  h  this help");
+  Serial.println("  p  print current config  <-- send me this when it's right");
+  Serial.println("  s  toggle axis swap (X<->Y)");
+  Serial.println("  x  toggle invert X");
+  Serial.println("  y  toggle invert Y");
+  Serial.println("  r  next display rotation (0-7; 4-7 are mirrored)");
+  Serial.println("  R  previous display rotation");
+  Serial.println("  c  auto-calibrate: tap the 4 corner targets");
+  Serial.println("  t  toggle per-touch serial logging (default off)");
+  Serial.println("  n  toggle panel colour inversion");
+  Serial.println("  b  toggle RGB/BGR colour order");
+  Serial.println("  w  wipe the screen (clear stray dots)");
+  Serial.println("----------------------------------------");
+  Serial.println("Try 's' / 'x' / 'y' first - taps landing mirrored or on");
+  Serial.println("the wrong axis is usually one of those three. Use 'c' if");
+  Serial.println("taps are in the right general area but drift near edges.");
+  Serial.println();
+}
+
+// ---- guided corner capture ----
 struct Sample { uint16_t rx, ry; };
 Sample corners[4];
 const char* cornerName[4] = { "TOP-LEFT", "TOP-RIGHT", "BOTTOM-LEFT", "BOTTOM-RIGHT" };
@@ -130,108 +216,113 @@ void drawTarget(int x, int y, const char* label) {
   tft.setTextDatum(textdatum_t::top_left);
 }
 
-void captureCorners() {
+void autoCalibrate() {
   int W = tft.width(), H = tft.height();
   const int inset = 24;
-  int px[4] = { inset, W - 1 - inset, inset,          W - 1 - inset };
-  int py[4] = { inset, inset,         H - 1 - inset,  H - 1 - inset };
+  int px[4] = { inset, W - 1 - inset, inset,         W - 1 - inset };
+  int py[4] = { inset, inset,         H - 1 - inset, H - 1 - inset };
 
+  Serial.println("\nCalibrate: tap each target as it appears.");
   for (int i = 0; i < 4; i++) {
     drawTarget(px[i], py[i], cornerName[i]);
-    Serial.printf("\nTap the %s target...\n", cornerName[i]);
     uint16_t rx, ry;
     while (!readTouch(rx, ry)) delay(10);
     corners[i] = { rx, ry };
     Serial.printf("  %-13s screen=(%3d,%3d)  RAW=(%4u,%4u)\n",
                   cornerName[i], px[i], py[i], rx, ry);
     tft.fillCircle(px[i], py[i], 7, TFT_RED);
-    delay(250);
+    delay(200);
     waitRelease();
   }
-}
 
-// derived mapping
-bool  swapXY = false, invX = false, invY = false;
-uint16_t rawXmin, rawXmax, rawYmin, rawYmax;
+  // Compare how much each raw axis moves per unit of screen-x versus
+  // screen-y: whichever raw axis tracks screen-x is the one that maps to
+  // x. That detects a swap from the data instead of guessing. The sign of
+  // that movement gives the inversion.
+  long dRX_dSX = ((long)corners[1].rx - corners[0].rx) + ((long)corners[3].rx - corners[2].rx);
+  long dRX_dSY = ((long)corners[2].rx - corners[0].rx) + ((long)corners[3].rx - corners[1].rx);
+  long dRY_dSX = ((long)corners[1].ry - corners[0].ry) + ((long)corners[3].ry - corners[2].ry);
+  long dRY_dSY = ((long)corners[2].ry - corners[0].ry) + ((long)corners[3].ry - corners[1].ry);
 
-void analyse() {
-  // How much does each raw axis move when the SCREEN x changes vs when
-  // the SCREEN y changes? Whichever raw axis tracks screen-x is the one
-  // that maps to x - that's what detects a swap, no guessing.
-  long dRawX_perScreenX = ((long)corners[1].rx - corners[0].rx) + ((long)corners[3].rx - corners[2].rx);
-  long dRawX_perScreenY = ((long)corners[2].rx - corners[0].rx) + ((long)corners[3].rx - corners[1].rx);
-  long dRawY_perScreenX = ((long)corners[1].ry - corners[0].ry) + ((long)corners[3].ry - corners[2].ry);
-  long dRawY_perScreenY = ((long)corners[2].ry - corners[0].ry) + ((long)corners[3].ry - corners[1].ry);
-
-  swapXY = (labs(dRawX_perScreenY) + labs(dRawY_perScreenX)) >
-           (labs(dRawX_perScreenX) + labs(dRawY_perScreenY));
+  swapXY = (labs(dRX_dSY) + labs(dRY_dSX)) > (labs(dRX_dSX) + labs(dRY_dSY));
 
   if (!swapXY) {
-    invX = dRawX_perScreenX < 0;
-    invY = dRawY_perScreenY < 0;
+    invX = dRX_dSX < 0;
+    invY = dRY_dSY < 0;
     rawXmin = min(min(corners[0].rx, corners[2].rx), min(corners[1].rx, corners[3].rx));
     rawXmax = max(max(corners[0].rx, corners[2].rx), max(corners[1].rx, corners[3].rx));
     rawYmin = min(min(corners[0].ry, corners[1].ry), min(corners[2].ry, corners[3].ry));
     rawYmax = max(max(corners[0].ry, corners[1].ry), max(corners[2].ry, corners[3].ry));
   } else {
-    invX = dRawY_perScreenX < 0;
-    invY = dRawX_perScreenY < 0;
+    invX = dRY_dSX < 0;
+    invY = dRX_dSY < 0;
     rawXmin = min(min(corners[0].ry, corners[2].ry), min(corners[1].ry, corners[3].ry));
     rawXmax = max(max(corners[0].ry, corners[2].ry), max(corners[1].ry, corners[3].ry));
     rawYmin = min(min(corners[0].rx, corners[1].rx), min(corners[2].rx, corners[3].rx));
     rawYmax = max(max(corners[0].rx, corners[1].rx), max(corners[2].rx, corners[3].rx));
   }
 
-  Serial.println("\n================ RESULT ================");
-  Serial.printf("display          : %d x %d\n", tft.width(), tft.height());
-  Serial.printf("axes swapped     : %s\n", swapXY ? "YES (raw X drives screen Y)" : "no");
-  Serial.printf("invert X         : %s\n", invX ? "YES" : "no");
-  Serial.printf("invert Y         : %s\n", invY ? "YES" : "no");
-  Serial.printf("raw X range      : %u .. %u\n", rawXmin, rawXmax);
-  Serial.printf("raw Y range      : %u .. %u\n", rawYmin, rawYmax);
-  Serial.println("----------------------------------------");
-  Serial.println("Paste these 6 lines back and they can be applied to the");
-  Serial.println("main firmware's touch config directly.");
-  Serial.println("========================================\n");
-  Serial.println("Free-draw mode: tap anywhere, a dot should appear exactly");
-  Serial.println("under your finger. Coordinates are printed for every touch.\n");
-}
-
-bool mapTouch(int &sx, int &sy) {
-  uint16_t rx, ry;
-  if (!readTouch(rx, ry)) return false;
-  uint16_t ax = swapXY ? ry : rx;
-  uint16_t ay = swapXY ? rx : ry;
-  long x = map(ax, rawXmin, rawXmax, 0, tft.width()  - 1);
-  long y = map(ay, rawYmin, rawYmax, 0, tft.height() - 1);
-  if (invX) x = tft.width()  - 1 - x;
-  if (invY) y = tft.height() - 1 - y;
-  sx = constrain(x, 0, tft.width()  - 1);
-  sy = constrain(y, 0, tft.height() - 1);
-  return true;
-}
-
-void drawFreeDrawScreen() {
-  tft.fillScreen(TFT_BLACK);
-  tft.drawRect(0, 0, tft.width(), tft.height(), TFT_DARKGREY);
-  // reference marks at the exact corners and centre
-  int W = tft.width(), H = tft.height();
-  int pts[5][2] = { {0,0}, {W-1,0}, {0,H-1}, {W-1,H-1}, {W/2,H/2} };
-  for (auto &p : pts) {
-    tft.drawLine(p[0]-10, p[1], p[0]+10, p[1], TFT_DARKGREEN);
-    tft.drawLine(p[0], p[1]-10, p[0], p[1]+10, TFT_DARKGREEN);
+  // targets sit `inset` in from each edge, so extrapolate the measured
+  // span out to the true 0..W-1 / 0..H-1 edges
+  int spanX = W - 1 - 2 * inset, spanY = H - 1 - 2 * inset;
+  if (spanX > 0) {
+    long perPx = ((long)rawXmax - rawXmin) / spanX;
+    rawXmin = (uint16_t)max(0L,    (long)rawXmin - perPx * inset);
+    rawXmax = (uint16_t)min(4095L, (long)rawXmax + perPx * inset);
   }
-  tft.setFont(&fonts::FreeSansBold9pt7b);
-  tft.setTextDatum(textdatum_t::middle_center);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawString("FREE DRAW - dots follow your finger", W / 2, 14);
-  tft.setTextDatum(textdatum_t::top_left);
+  if (spanY > 0) {
+    long perPx = ((long)rawYmax - rawYmin) / spanY;
+    rawYmin = (uint16_t)max(0L,    (long)rawYmin - perPx * inset);
+    rawYmax = (uint16_t)min(4095L, (long)rawYmax + perPx * inset);
+  }
+
+  printConfig();
+  drawUI();
+}
+
+void applyRotation() {
+  tft.setRotation(rotation);
+  drawUI();
+  Serial.printf("rotation=%u  display=%dx%d\n", rotation, tft.width(), tft.height());
+}
+
+void handleSerial() {
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\r' || c == '\n' || c == ' ') continue;
+    switch (c) {
+      case 'h': printHelp(); break;
+      case 'p': printConfig(); break;
+      case 's': swapXY = !swapXY; Serial.printf("swapXY=%s\n", swapXY?"true":"false"); drawUI(); break;
+      case 'x': invX = !invX;     Serial.printf("invX=%s\n",   invX?"true":"false");   drawUI(); break;
+      case 'y': invY = !invY;     Serial.printf("invY=%s\n",   invY?"true":"false");   drawUI(); break;
+      case 'r': rotation = (rotation + 1) & 7; applyRotation(); break;
+      case 'R': rotation = (rotation + 7) & 7; applyRotation(); break;
+      case 'c': autoCalibrate(); break;
+      case 't': verbose = !verbose; Serial.printf("touch logging %s\n", verbose?"ON":"off"); break;
+      case 'w': drawUI(); break;
+      case 'n':
+        invertDisp = !invertDisp;
+        tft.invertDisplay(invertDisp);
+        Serial.printf("panel invert=%s\n", invertDisp?"true":"false");
+        break;
+      case 'b':
+        // no runtime setter for colour order - report what to change and
+        // where, rather than pretending it took effect
+        bgrOrder = !bgrOrder;
+        Serial.printf("rgb_order BGR=%s  (compile-time: set cfg.rgb_order in the config to match, then re-flash)\n",
+                      bgrOrder?"true":"false");
+        break;
+      default:
+        Serial.printf("unknown key '%c' - press 'h' for help\n", c);
+        break;
+    }
+  }
 }
 
 void setup() {
   Serial.begin(115200);
   delay(600);
-  Serial.println("\n\n=== CYD touch debug ===");
 
   pinMode(T_CS, OUTPUT);
   digitalWrite(T_CS, HIGH);
@@ -239,38 +330,36 @@ void setup() {
   touchSPI.begin(T_CLK, T_MISO, T_MOSI, T_CS);
 
   tft.init();
-  tft.setRotation(0);          // deliberately plain - this sketch derives
-  tft.setTextWrap(false);      // the mapping itself rather than relying on one
+  tft.setRotation(rotation);
+  tft.setTextWrap(false);
   tft.setBrightness(180);
 
+  Serial.println("\n\n=== CYD touch debug (interactive) ===");
   Serial.printf("display reports %d x %d\n", tft.width(), tft.height());
-  tft.fillScreen(TFT_BLACK);
-  tft.setFont(&fonts::FreeSansBold12pt7b);
-  tft.setTextDatum(textdatum_t::middle_center);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawString("CYD TOUCH DEBUG", tft.width() / 2, tft.height() / 2 - 16);
-  tft.setFont(&fonts::FreeSans9pt7b);
-  tft.drawString(String(tft.width()) + " x " + String(tft.height()),
-                 tft.width() / 2, tft.height() / 2 + 14);
-  tft.setTextDatum(textdatum_t::top_left);
-  delay(1800);
-
-  captureCorners();
-  analyse();
-  drawFreeDrawScreen();
+  printHelp();
+  printConfig();
+  drawUI();
 }
 
 void loop() {
+  handleSerial();
+
   int x, y;
   if (mapTouch(x, y)) {
     tft.fillCircle(x, y, 4, TFT_RED);
-    tft.fillRect(0, tft.height() - 22, tft.width(), 22, TFT_BLACK);
+    // coordinates on-screen always (not serial spam) so the mapping can be
+    // judged by eye without watching the monitor
+    tft.fillRect(0, tft.height() - 20, tft.width(), 20, TFT_BLACK);
     tft.setFont(&fonts::FreeSansBold9pt7b);
     tft.setTextDatum(textdatum_t::middle_center);
     tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-    tft.drawString(String(x) + " , " + String(y), tft.width() / 2, tft.height() - 11);
+    tft.drawString(String(x) + " , " + String(y), tft.width() / 2, tft.height() - 10);
     tft.setTextDatum(textdatum_t::top_left);
-    Serial.printf("touch -> screen (%3d,%3d)\n", x, y);
-    delay(60);
+
+    if (verbose && millis() - lastVerboseAt >= VERBOSE_MIN_GAP_MS) {
+      lastVerboseAt = millis();
+      Serial.printf("touch -> (%3d,%3d)\n", x, y);
+    }
+    delay(40);
   }
 }
