@@ -2178,6 +2178,7 @@ void handleRoot() {
 // and these are called from web handlers defined above it.
 void cydShowLearnScreen();
 void cydRefreshHome();   // redraws Home only if Home is what's showing
+void cydLeaveLearn();    // back to Home, but only if the Learn screen is up
 #endif
 
 // Also the entry point CYD's on-screen "Learn New" tap uses (see
@@ -2753,7 +2754,7 @@ void handleRemoteTeachAll() {
 void handleRemoteTeachStop() {
   stopTeachAll("Teach all stopped");
 #ifdef BOARD_CYD
-  if (currentCydScreen == CYD_LEARN) cydShowScreen(CYD_HOME);
+  cydLeaveLearn();
 #endif
   finishRequest();
 }
@@ -3622,6 +3623,7 @@ void cydShowScreen(CydScreen s) {
 // its forward-declaration point.
 void cydShowLearnScreen() { cydShowScreen(CYD_LEARN); }
 void cydRefreshHome() { if (currentCydScreen == CYD_HOME) cydDrawHome(); }
+void cydLeaveLearn() { if (currentCydScreen == CYD_LEARN) cydShowScreen(CYD_HOME); }
 
 // Dispatches a touch point to whichever action zone (if any) it lands in
 // on the currently active screen. Reuses the exact same shared triggers
