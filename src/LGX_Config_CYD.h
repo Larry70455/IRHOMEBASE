@@ -18,20 +18,31 @@
 // consequences:
 //  1. rgb_order is BGR (true), not RGB - set below. This part is no
 //     longer a guess.
-//  2. Since MADCTL's mirror/swap bits are unverified for this specific
-//     clone (LovyanGFX has no raw-MADCTL override to match TFT_eSPI's
-//     fixed 0x08 exactly), CYD_ROTATION below stays the adjustable
-//     fallback for mirrored/rotated/partially-updating display - cycle
-//     0/1/2/3 and re-flash. CYD_TOUCH_ROTATION is the equivalent knob for
-//     touch coordinates, adjustable independently since it doesn't always
-//     match CYD_ROTATION.
+//  2. That fixed 0x08 leaves MADCTL's MX/MY/MV mirror+swap bits at 0,
+//     which does NOT match what LovyanGFX's stock Panel_ILI9341 assumes it
+//     wrote. When the library's idea of the mirror bits disagrees with the
+//     panel's actual state, two things follow together: the image comes out
+//     mirrored, AND the CASET/RASET address window the library sets for a
+//     fillScreen() maps to a shifted region on the panel - leaving a strip
+//     that never gets written, in a fixed place, no matter the rotation.
+//     Mirrored text and the unfilled strip are one bug, not two.
+//
+// THE FIX - CYD_ROTATION accepts 0-7, not 0-3. LovyanGFX's
+// Panel_LCD::setRotation() does `r &= 7`, and bit 2 is the mirror/flip bit:
+// 0-3 are the four plain rotations, 4-7 are those same four MIRRORED. A
+// mirrored panel can never be corrected by 0-3 (a rotation cannot undo a
+// reflection) - it just spins the mirrored image, which is exactly the
+// "it rotates but text is still backwards" symptom. Values 4-7 are the
+// ones that fix it. Try 4, then 5, 6, 7.
 //
 // CYD_ROTATION only drives tft.setRotation() at runtime (see setup() in
 // main.cpp) - the panel's own offset_rotation below stays fixed at 0. They
 // compose (offset_rotation is a baked-in pre-rotation, setRotation() is
 // added on top), so driving both off the same constant would have doubled
-// up and only reached 2 of the 4 possible states instead of all 4.
-#define CYD_ROTATION 0
+// up and only reached half the possible states.
+#define CYD_ROTATION 4
+// Touch: same 0-7 convention. Leave this alone until the DISPLAY is
+// correct - only then does a mismatch here mean anything.
 #define CYD_TOUCH_ROTATION 0
 
 #define LGFX_USE_V1

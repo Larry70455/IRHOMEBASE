@@ -2932,7 +2932,9 @@ void setup() {
 
   tft.init();
 #ifdef BOARD_CYD
-  tft.setRotation(CYD_ROTATION);  // adjust this constant in LGX_Config_CYD.h if the display looks mirrored/rotated wrong
+  // 0-7: 0-3 plain rotations, 4-7 the same but mirrored. Backward text
+  // needs a 4-7 value - see the notes in LGX_Config_CYD.h.
+  tft.setRotation(CYD_ROTATION);
 #else
   tft.setRotation(0);
 #endif
