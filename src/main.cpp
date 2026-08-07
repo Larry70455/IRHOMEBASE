@@ -2871,7 +2871,11 @@ void setup() {
   Serial.begin(115200);
   delay(500);
 
+#ifndef BOARD_CYD
   initWatchdog();  // arm early so a hang anywhere in setup() is also caught
+#endif
+  // CYD arms it further down instead, after touch calibration - see the
+  // comment there for why.
 
   // sensible defaults before loadProfile() has a chance to override them
   // with anything actually saved - otherwise an un-customized slot would
@@ -2907,8 +2911,17 @@ void setup() {
   // Touch calibration: load a previously-saved result if there is one:
   // interactive crosshairs (LGFX's built-in helper, not a hand-rolled
   // 2-point tap UI) only run on the very first boot, or after /cydrecalibrate
-  // clears the saved file. Blocking, but only here at boot - same as the
-  // WiFi-connect-retry loop below - loop() itself stays fully non-blocking.
+  // clears the saved file.
+  //
+  // The watchdog is NOT armed yet at this point (see setup()'s start) -
+  // calibrateTouch() blocks waiting for real taps with no way for this code
+  // to feed the watchdog while it's waiting (it's one opaque library call,
+  // not a loop this code controls), and a first-time calibration taking
+  // longer than the watchdog's timeout is completely normal, not a hang.
+  // Arming the watchdog before this point was resetting the board mid-
+  // calibration. It's armed right after instead, once every remaining step
+  // in setup() is either fast or already feeds it explicitly (the WiFi
+  // retry loop below does).
   uint16_t cydCalibData[8];
   if (!cydLoadTouchCalib(cydCalibData)) {
     tft.calibrateTouch(cydCalibData, TFT_WHITE, TFT_BLACK, 20);
@@ -2916,6 +2929,7 @@ void setup() {
   } else {
     tft.setTouchCalibrate(cydCalibData);
   }
+  initWatchdog();
 #endif
 
   updateScreen("Booting...");
