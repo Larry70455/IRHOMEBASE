@@ -52,11 +52,24 @@
 // land somewhere other than where you actually press.
 #define CYD_TOUCH_ROTATION 0
 
+// Two CYD hardware variants exist with the SAME pins but DIFFERENT display
+// controllers - the reference project ships two separate display configs
+// for exactly this reason:
+//   * one micro-USB port only  -> ILI9341   (leave the line below commented)
+//   * micro-USB AND USB-C      -> ST7789    (uncomment the line below)
+// Only relevant if the display doesn't init at all; the panel-size fix
+// below is what resolved the partial-update problem on this unit.
+// #define CYD_PANEL_ST7789
+
 #define LGFX_USE_V1
 #include <LovyanGFX.hpp>
 
 class LGFX : public lgfx::LGFX_Device {
+#ifdef CYD_PANEL_ST7789
+  lgfx::Panel_ST7789 _panel_instance;
+#else
   lgfx::Panel_ILI9341 _panel_instance;
+#endif
   lgfx::Bus_SPI _bus_instance;
   lgfx::Light_PWM _light_instance;
   lgfx::Touch_XPT2046 _touch_instance;
@@ -67,15 +80,10 @@ public:
       auto cfg = _bus_instance.config();
       cfg.spi_host = VSPI_HOST;
       cfg.spi_mode = 0;
-      // Backward text and a screen that's never fully filled, persisting
-      // across every rotation value, doesn't fit a pure orientation/MADCTL
-      // problem (rotation can't produce a mirror on its own, and a real
-      // MV/transpose issue would move the unfilled region as rotation
-      // changes, not leave it fixed) - dropped/corrupted bytes on a long
-      // fillScreen() transfer would produce exactly this instead: same
-      // symptom regardless of orientation. Backed off from 40MHz as a
-      // cheap, safe thing to rule out - this can only help or do nothing,
-      // never make the corruption worse.
+      // 20MHz rather than 40MHz. This was originally tried while chasing
+      // the partial-update bug (that turned out to be the panel size, see
+      // below) and made no difference to it - kept anyway because the
+      // lower rate is the safer default on these clone boards.
       cfg.freq_write = 20000000;
       cfg.freq_read  = 16000000;
       cfg.spi_3wire  = true;
@@ -94,8 +102,13 @@ public:
       cfg.pin_cs           = 15;
       cfg.pin_rst          = -1;   // tied to EN on this board, no dedicated reset pin
       cfg.pin_busy         = -1;
-      cfg.panel_width      = 240;
-      cfg.panel_height     = 320;
+      // THIS is what made part of the panel never update and the layout
+      // not line up: this board's panel is 320x240, not the 240x320 that
+      // an ILI9341 datasheet leads you to assume. Confirmed on hardware -
+      // swapping these two numbers made everything line up. Do not "fix"
+      // this back to 240x320.
+      cfg.panel_width      = 320;
+      cfg.panel_height     = 240;
       cfg.offset_x         = 0;
       cfg.offset_y         = 0;
       cfg.offset_rotation  = 0;  // fixed - CYD_ROTATION drives tft.setRotation() at runtime instead, see the comment above

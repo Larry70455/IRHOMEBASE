@@ -2575,7 +2575,7 @@ void initWatchdog() {
 
 const int CYD_BANNER_H = 50;  // persistent status strip, shared across every CYD screen
 
-enum CydScreen { CYD_HOME, CYD_LEARN, CYD_SETTINGS };
+enum CydScreen { CYD_HOME, CYD_LEARN, CYD_SETTINGS, CYD_TOUCHTEST };
 CydScreen currentCydScreen = CYD_HOME;
 
 struct TapZone {
@@ -2602,6 +2602,7 @@ const int CYD_ACTION_ROT_PREV = -9;
 const int CYD_ACTION_TROT_NEXT = -10;
 const int CYD_ACTION_TROT_PREV = -11;
 const int CYD_ACTION_RECALIBRATE = -12;
+const int CYD_ACTION_TOUCHTEST = -13;
 
 int cydHomePage = 0;
 const int CYD_COLS_MAX = 4;      // wider remoteColumns settings get clamped here for legibility - the full column count still applies on the web Remote tab
@@ -2909,8 +2910,10 @@ void cydDrawSettings() {
   // Back button - both drawn, overlapping, with two live tap zones in the
   // same place.
   int backY = SCREEN_H - pad - rowH;
+  int halfW = (SCREEN_W - 2 * pad - gap) / 2;
   if (y + rowH + gap <= backY) {
-    cydDrawButton(pad, y, SCREEN_W - 2 * pad, rowH, "Recalibrate touch", TFT_DARKGREEN, TFT_WHITE, CYD_ACTION_RECALIBRATE);
+    cydDrawButton(pad, y, halfW, rowH, "Recalib", TFT_DARKGREEN, TFT_WHITE, CYD_ACTION_RECALIBRATE);
+    cydDrawButton(pad + halfW + gap, y, halfW, rowH, "Touch test", TFT_PURPLE, TFT_WHITE, CYD_ACTION_TOUCHTEST);
   }
   cydDrawButton(pad, backY, SCREEN_W - 2 * pad, rowH, "Back", TFT_NAVY, TFT_WHITE, CYD_ACTION_BACK_HOME);
 
@@ -2946,6 +2949,60 @@ void cydDrawLearn() {
   tft.endWrite();
 }
 
+// Touch test: draws targets at the four extreme corners and the centre at
+// known coordinates, then marks wherever you actually touch. Purpose is to
+// settle the "is the panel extent right?" question by measurement - if the
+// corner targets don't sit at the physical corners of the glass, the
+// firmware's idea of the panel size is wrong, and that's visible directly
+// rather than deduced. Every touch is also printed to serial.
+// Auto-exits so a badly mis-mapped touch layer can't strand you here.
+unsigned long cydTouchTestUntil = 0;
+const unsigned long CYD_TOUCHTEST_MS = 45000;
+
+void cydDrawTouchTest() {
+  cydZoneCount = 0;
+  tft.startWrite();
+  tft.fillScreen(TFT_BLACK);
+  tft.drawRect(0, 0, SCREEN_W, SCREEN_H, TFT_WHITE);
+
+  // corner + centre targets at exactly-known coordinates
+  const int r = 14;
+  struct { int x, y; } pts[5] = {
+    {0, 0}, {SCREEN_W - 1, 0}, {0, SCREEN_H - 1}, {SCREEN_W - 1, SCREEN_H - 1},
+    {SCREEN_W / 2, SCREEN_H / 2}
+  };
+  for (int i = 0; i < 5; i++) {
+    tft.drawCircle(pts[i].x, pts[i].y, r, TFT_GREEN);
+    tft.drawLine(pts[i].x - r, pts[i].y, pts[i].x + r, pts[i].y, TFT_GREEN);
+    tft.drawLine(pts[i].x, pts[i].y - r, pts[i].x, pts[i].y + r, TFT_GREEN);
+  }
+
+  tft.setFont(&fonts::FreeSansBold9pt7b);
+  tft.setTextDatum(textdatum_t::middle_center);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString(truncateToWidth("TOUCH TEST", SCREEN_W - 20), SCREEN_W / 2, SCREEN_H / 2 - 46);
+  tft.drawString(truncateToWidth(String(SCREEN_W) + "x" + String(SCREEN_H) + " rot" + String(cydRotation), SCREEN_W - 20),
+                 SCREEN_W / 2, SCREEN_H / 2 - 26);
+  tft.drawString(truncateToWidth("tap corners - auto-exits", SCREEN_W - 20), SCREEN_W / 2, SCREEN_H / 2 + 30);
+  tft.setTextDatum(textdatum_t::top_left);
+  tft.endWrite();
+
+  cydTouchTestUntil = millis() + CYD_TOUCHTEST_MS;
+}
+
+// Marks a touch without redrawing the whole screen, so successive taps
+// accumulate and you can see the pattern they form.
+void cydMarkTouch(int x, int y) {
+  tft.fillCircle(x, y, 5, TFT_RED);
+  tft.setFont(&fonts::FreeSansBold9pt7b);
+  tft.setTextDatum(textdatum_t::middle_center);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  // printed near the centre where it won't be clipped at an edge
+  tft.fillRect(0, SCREEN_H / 2 + 44, SCREEN_W, 22, TFT_BLACK);
+  tft.drawString(truncateToWidth(String(x) + "," + String(y), SCREEN_W - 20), SCREEN_W / 2, SCREEN_H / 2 + 55);
+  tft.setTextDatum(textdatum_t::top_left);
+}
+
 void cydShowScreen(CydScreen s) {
   currentCydScreen = s;
   if (s == CYD_HOME) {
@@ -2953,6 +3010,8 @@ void cydShowScreen(CydScreen s) {
     cydDrawHome();
   } else if (s == CYD_SETTINGS) {
     cydDrawSettings();
+  } else if (s == CYD_TOUCHTEST) {
+    cydDrawTouchTest();
   } else {
     cydDrawLearn();
   }
@@ -2982,6 +3041,13 @@ void cydFlashZone(const TapZone &z) {
 }
 
 void cydHandleTouch(int x, int y) {
+  // Touch test consumes every touch itself - no zones, nothing to trigger
+  // accidentally while a mis-mapped touch layer is being measured.
+  if (currentCydScreen == CYD_TOUCHTEST) {
+    cydMarkTouch(x, y);
+    return;
+  }
+
   for (int i = 0; i < cydZoneCount; i++) {
     TapZone &z = cydZones[i];
     if (x < z.x || x >= z.x + z.w || y < z.y || y >= z.y + z.h) continue;
@@ -3045,6 +3111,9 @@ void cydHandleTouch(int x, int y) {
         cydSaveDisplaySettings();  // no apply step needed - cydTransformTouch() reads the value live
         cydDrawSettings();
         cydRedrawAt = 0;
+      } else if (action == CYD_ACTION_TOUCHTEST) {
+        cydShowScreen(CYD_TOUCHTEST);
+        cydRedrawAt = 0;
       } else if (action == CYD_ACTION_RECALIBRATE) {
         LittleFS.remove(CYD_CALIB_PATH);
         updateScreen("Rebooting to recalibrate");
@@ -3068,6 +3137,17 @@ void cydHandleTouchPoll() {
     lastCydTouchAt = millis();
     int x = (int)tx, y = (int)ty;
     cydTransformTouch(x, y);  // no-op unless the Settings screen's touch-fix value is non-zero
+
+    // Always logged, every touch, on every screen. Open the serial monitor
+    // (115200) and tap the four physical corners of the glass: if the
+    // reported coordinates don't run from roughly 0,0 to SCREEN_W-1,
+    // SCREEN_H-1, then the panel extent the firmware is using does not
+    // match the real display - which is measurable here instead of being
+    // inferred from how the layout looks.
+    Serial.printf("TOUCH raw=(%ld,%ld) mapped=(%d,%d) screen=%dx%d rot=%u touchfix=%u screen_id=%d\n",
+                  (long)tx, (long)ty, x, y, SCREEN_W, SCREEN_H,
+                  (unsigned)cydRotation, (unsigned)cydTouchRotation, (int)currentCydScreen);
+
     cydHandleTouch(x, y);
   }
 }
@@ -3406,6 +3486,12 @@ void loop() {
     cydRedrawAt = 0;
     if (currentCydScreen == CYD_HOME) cydDrawHome();
     else if (currentCydScreen == CYD_SETTINGS) cydDrawSettings();
+  }
+  // touch test is self-limiting so a badly mis-mapped touch layer can't
+  // leave you stuck on a screen with no reachable way out
+  if (currentCydScreen == CYD_TOUCHTEST && cydTouchTestUntil && millis() >= cydTouchTestUntil) {
+    cydTouchTestUntil = 0;
+    cydShowScreen(CYD_SETTINGS);
   }
 #endif
 
