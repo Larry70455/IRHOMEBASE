@@ -49,7 +49,16 @@ public:
       auto cfg = _bus_instance.config();
       cfg.spi_host = VSPI_HOST;
       cfg.spi_mode = 0;
-      cfg.freq_write = 40000000;
+      // Backward text and a screen that's never fully filled, persisting
+      // across every rotation value, doesn't fit a pure orientation/MADCTL
+      // problem (rotation can't produce a mirror on its own, and a real
+      // MV/transpose issue would move the unfilled region as rotation
+      // changes, not leave it fixed) - dropped/corrupted bytes on a long
+      // fillScreen() transfer would produce exactly this instead: same
+      // symptom regardless of orientation. Backed off from 40MHz as a
+      // cheap, safe thing to rule out - this can only help or do nothing,
+      // never make the corruption worse.
+      cfg.freq_write = 20000000;
       cfg.freq_read  = 16000000;
       cfg.spi_3wire  = true;
       cfg.use_lock   = true;
