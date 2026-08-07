@@ -25,6 +25,12 @@
 //     0/1/2/3 and re-flash. CYD_TOUCH_ROTATION is the equivalent knob for
 //     touch coordinates, adjustable independently since it doesn't always
 //     match CYD_ROTATION.
+//
+// CYD_ROTATION only drives tft.setRotation() at runtime (see setup() in
+// main.cpp) - the panel's own offset_rotation below stays fixed at 0. They
+// compose (offset_rotation is a baked-in pre-rotation, setRotation() is
+// added on top), so driving both off the same constant would have doubled
+// up and only reached 2 of the 4 possible states instead of all 4.
 #define CYD_ROTATION 0
 #define CYD_TOUCH_ROTATION 0
 
@@ -65,7 +71,7 @@ public:
       cfg.panel_height     = 320;
       cfg.offset_x         = 0;
       cfg.offset_y         = 0;
-      cfg.offset_rotation  = CYD_ROTATION;
+      cfg.offset_rotation  = 0;  // fixed - CYD_ROTATION drives tft.setRotation() at runtime instead, see the comment above
       cfg.invert           = false;  // ILI9341 - unlike the other board's ST7789, no invert needed. Flip this too if colors look inverted once orientation is fixed.
       cfg.rgb_order        = true;   // this board's clone panel init sets the BGR bit - see the comment above
       _panel_instance.config(cfg);
