@@ -2618,26 +2618,46 @@ const int CYD_MIN_CELL = 40;     // below this a tile is too small to reliably h
 // and it must NOT travel with a profile export/import between boards.
 uint8_t cydRotation = CYD_ROTATION;
 uint8_t cydTouchRotation = CYD_TOUCH_ROTATION;
-#define CYD_DISPLAY_PATH "/cyd_display.bin"
+#define CYD_DISPLAY_PATH "/cyd_display.txt"
+
+// Stamped with the firmware build. LittleFS survives a firmware upload, so
+// without this a value saved while hunting for the right orientation keeps
+// overriding the compile-time default on every later flash - which is
+// exactly what made a corrected default appear to have no effect. A new
+// build discards the saved values and uses the defaults it shipped with;
+// anything changed in Settings after that persists normally until the next
+// flash.
+static const char CYD_BUILD_ID[] = __DATE__ " " __TIME__;
 
 bool cydLoadDisplaySettings() {
   if (!LittleFS.exists(CYD_DISPLAY_PATH)) return false;
   File f = LittleFS.open(CYD_DISPLAY_PATH, "r");
   if (!f) return false;
-  uint8_t buf[2];
-  size_t n = f.read(buf, 2);
+  String stamp = f.readStringUntil('\n');
+  String rot   = f.readStringUntil('\n');
+  String fix   = f.readStringUntil('\n');
   f.close();
-  if (n != 2 || buf[0] > 7 || buf[1] > 7) return false;  // corrupt/garbage - fall back to the compile-time defaults
-  cydRotation = buf[0];
-  cydTouchRotation = buf[1];
+  stamp.trim();
+
+  if (stamp != CYD_BUILD_ID) {
+    Serial.println("Display settings are from an older firmware - using this build's defaults");
+    LittleFS.remove(CYD_DISPLAY_PATH);
+    return false;
+  }
+  int r = rot.toInt(), x = fix.toInt();
+  if (r < 0 || r > 7 || x < 0 || x > 7) return false;  // corrupt - fall back to defaults
+  cydRotation = (uint8_t)r;
+  cydTouchRotation = (uint8_t)x;
+  Serial.printf("Loaded saved display settings: rotation=%d touchfix=%d\n", r, x);
   return true;
 }
 
 void cydSaveDisplaySettings() {
   File f = LittleFS.open(CYD_DISPLAY_PATH, "w");
   if (!f) return;
-  uint8_t buf[2] = { cydRotation, cydTouchRotation };
-  f.write(buf, 2);
+  f.println(CYD_BUILD_ID);
+  f.println(cydRotation);
+  f.println(cydTouchRotation);
   f.close();
 }
 
@@ -3168,6 +3188,54 @@ void cydHandleTouchPoll() {
   cydHandleTouch(sx, sy);
 }
 
+// /cyddisplay - read and change orientation over HTTP. Exists because the
+// on-device Settings screen is unreachable whenever touch is mis-mapped,
+// which is exactly when orientation most needs changing. Works from a
+// browser regardless of what touch is doing.
+//   /cyddisplay                     -> show current values
+//   /cyddisplay?rot=5               -> set screen rotation (0-7)
+//   /cyddisplay?fix=2               -> set touch fix (bit0 invX, bit1 invY, bit2 swap)
+//   /cyddisplay?reset=1             -> discard saved values, back to firmware defaults
+void handleCydDisplay() {
+  bool changed = false;
+
+  if (server.hasArg("reset")) {
+    LittleFS.remove(CYD_DISPLAY_PATH);
+    cydRotation = CYD_ROTATION;
+    cydTouchRotation = CYD_TOUCH_ROTATION;
+    cydApplyRotation();
+    changed = true;
+  }
+  if (server.hasArg("rot")) {
+    int r = server.arg("rot").toInt();
+    if (r < 0 || r > 7) {
+      server.send(400, "text/plain", "rot must be 0-7 (4-7 are the mirrored variants)");
+      return;
+    }
+    cydRotation = (uint8_t)r;
+    cydApplyRotation();
+    changed = true;
+  }
+  if (server.hasArg("fix")) {
+    int x = server.arg("fix").toInt();
+    if (x < 0 || x > 7) {
+      server.send(400, "text/plain", "fix must be 0-7 (bit0 invert X, bit1 invert Y, bit2 swap X/Y)");
+      return;
+    }
+    cydTouchRotation = (uint8_t)x;
+    changed = true;
+  }
+
+  if (changed && !server.hasArg("reset")) cydSaveDisplaySettings();
+  if (changed) cydShowScreen(CYD_HOME);
+
+  String out = "rotation = " + String(cydRotation) + "   (0-7, 4-7 mirrored)\n";
+  out += "touch fix = " + String(cydTouchRotation) + "   (bit0 invX, bit1 invY, bit2 swapXY)\n";
+  out += "screen    = " + String(SCREEN_W) + " x " + String(SCREEN_H) + "\n";
+  out += "build     = " + String(CYD_BUILD_ID) + "\n\n";
+  out += "/cyddisplay?rot=N   /cyddisplay?fix=N   /cyddisplay?reset=1\n";
+  server.send(200, "text/plain", out);
+}
 
 #endif  // BOARD_CYD
 
@@ -3275,6 +3343,9 @@ void setup() {
   server.on("/remote/columns", handleRemoteColumns);
   server.on("/trylookup", handleTryLookup);
   server.on("/savelookupcode", handleSaveLookupCode);
+#ifdef BOARD_CYD
+  server.on("/cyddisplay", handleCydDisplay);
+#endif
   server.begin();
 
   updateScreen("Ready");
