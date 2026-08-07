@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <utility>
 #include <ctype.h>
+#include <SPI.h>   // CYD reads the XPT2046 touch controller directly over its own SPI instance
 
 // Board selection is set at the build-system level: platformio.ini's
 // [env:cyd] passes -D BOARD_CYD, [env:esp32-s3-devkitm-1] doesn't. Every
@@ -2601,7 +2602,6 @@ const int CYD_ACTION_ROT_NEXT = -8;
 const int CYD_ACTION_ROT_PREV = -9;
 const int CYD_ACTION_TROT_NEXT = -10;
 const int CYD_ACTION_TROT_PREV = -11;
-const int CYD_ACTION_RECALIBRATE = -12;
 const int CYD_ACTION_TOUCHTEST = -13;
 
 int cydHomePage = 0;
@@ -2619,10 +2619,6 @@ const int CYD_MIN_CELL = 40;     // below this a tile is too small to reliably h
 uint8_t cydRotation = CYD_ROTATION;
 uint8_t cydTouchRotation = CYD_TOUCH_ROTATION;
 #define CYD_DISPLAY_PATH "/cyd_display.bin"
-// Defined up here rather than beside its helpers further down: the
-// Settings screen's "Recalibrate" action references it, and that code
-// comes first in the file.
-#define CYD_CALIB_PATH "/cyd_touch_calib.bin"
 
 bool cydLoadDisplaySettings() {
   if (!LittleFS.exists(CYD_DISPLAY_PATH)) return false;
@@ -2659,30 +2655,59 @@ void cydApplyRotation() {
   if (SCREEN_H <= 0) SCREEN_H = 320;
 }
 
-// ---------- recalibrate on every new firmware ----------
-// LittleFS survives a normal firmware upload, so touch calibration
-// captured once against a mis-configured display would otherwise persist
-// across every future flash - and because the interactive calibration only
-// runs when no saved file exists, it would never reappear to let you redo
-// it. Stamping the build and wiping calibration when the stamp changes
-// means each new flash starts from a fresh calibration.
-#define CYD_BUILD_PATH "/cyd_build.txt"
-static const char CYD_BUILD_ID[] = __DATE__ " " __TIME__;
+// ---------- XPT2046 touch, read directly ----------
+// Not via LovyanGFX's touch layer, and with no calibrate-and-store step at
+// all. The raw ADC range is a measured property of this hardware (see the
+// CYD_RAW_* values in LGX_Config_CYD.h, captured with
+// debug/cyd_touch_debug.cpp), so there is nothing to calibrate at runtime -
+// which also removes the failure mode where a bad stored calibration made
+// the on-device Settings screen unreachable and could only be cleared by
+// re-flashing.
+#define T_CLK  25
+#define T_MOSI 32
+#define T_MISO 39
+#define T_CS   33
+#define T_IRQ  36
 
-bool cydFirmwareChanged() {
-  String stored;
-  File f = LittleFS.open(CYD_BUILD_PATH, "r");
-  if (f) {
-    stored = f.readString();
-    f.close();
+SPIClass touchSPI(HSPI);
+
+// 0xD0 = read X, 0x90 = read Y (12-bit, differential mode)
+uint16_t cydXptRead(uint8_t cmd) {
+  touchSPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+  digitalWrite(T_CS, LOW);
+  touchSPI.transfer(cmd);
+  uint8_t hi = touchSPI.transfer(0x00);
+  uint8_t lo = touchSPI.transfer(0x00);
+  digitalWrite(T_CS, HIGH);
+  touchSPI.endTransaction();
+  return ((uint16_t)((hi << 8) | lo)) >> 3;   // 12 significant bits
+}
+
+bool cydTouchDown() { return digitalRead(T_IRQ) == LOW; }
+
+// Median of several samples - individual reads are noisy enough that one
+// sample can be far enough off to land in the wrong button.
+bool cydReadRawTouch(uint16_t &rx, uint16_t &ry) {
+  if (!cydTouchDown()) return false;
+  const int N = 5;
+  uint16_t xs[N], ys[N];
+  for (int i = 0; i < N; i++) {
+    if (!cydTouchDown()) return false;   // released mid-read - discard
+    ys[i] = cydXptRead(0x90);
+    xs[i] = cydXptRead(0xD0);
   }
-  if (stored == CYD_BUILD_ID) return false;
-  File w = LittleFS.open(CYD_BUILD_PATH, "w");
-  if (w) {
-    w.print(CYD_BUILD_ID);
-    w.close();
+  for (int i = 1; i < N; i++) {          // insertion sort, N is tiny
+    uint16_t kx = xs[i], ky = ys[i];
+    int j = i - 1;
+    while (j >= 0 && xs[j] > kx) { xs[j+1] = xs[j]; j--; }
+    xs[j+1] = kx;
+    j = i - 1;
+    while (j >= 0 && ys[j] > ky) { ys[j+1] = ys[j]; j--; }
+    ys[j+1] = ky;
   }
-  return true;
+  rx = xs[N/2];
+  ry = ys[N/2];
+  return rx > 100 && rx < 4000 && ry > 100 && ry < 4000;  // reject rail readings
 }
 
 // Touch axis correction, applied to the coordinates LGFX hands back rather
@@ -2910,10 +2935,8 @@ void cydDrawSettings() {
   // Back button - both drawn, overlapping, with two live tap zones in the
   // same place.
   int backY = SCREEN_H - pad - rowH;
-  int halfW = (SCREEN_W - 2 * pad - gap) / 2;
   if (y + rowH + gap <= backY) {
-    cydDrawButton(pad, y, halfW, rowH, "Recalib", TFT_DARKGREEN, TFT_WHITE, CYD_ACTION_RECALIBRATE);
-    cydDrawButton(pad + halfW + gap, y, halfW, rowH, "Touch test", TFT_PURPLE, TFT_WHITE, CYD_ACTION_TOUCHTEST);
+    cydDrawButton(pad, y, SCREEN_W - 2 * pad, rowH, "Touch test", TFT_PURPLE, TFT_WHITE, CYD_ACTION_TOUCHTEST);
   }
   cydDrawButton(pad, backY, SCREEN_W - 2 * pad, rowH, "Back", TFT_NAVY, TFT_WHITE, CYD_ACTION_BACK_HOME);
 
@@ -3114,11 +3137,6 @@ void cydHandleTouch(int x, int y) {
       } else if (action == CYD_ACTION_TOUCHTEST) {
         cydShowScreen(CYD_TOUCHTEST);
         cydRedrawAt = 0;
-      } else if (action == CYD_ACTION_RECALIBRATE) {
-        LittleFS.remove(CYD_CALIB_PATH);
-        updateScreen("Rebooting to recalibrate");
-        delay(300);
-        ESP.restart();
       }
     }
     return;  // stop at the first matching zone
@@ -3132,109 +3150,24 @@ const unsigned long CYD_TOUCH_DEBOUNCE_MS = 300;
 
 void cydHandleTouchPoll() {
   if (millis() - lastCydTouchAt < CYD_TOUCH_DEBOUNCE_MS) return;
-  int32_t tx, ty;
-  if (tft.getTouch(&tx, &ty)) {
-    lastCydTouchAt = millis();
-    int x = (int)tx, y = (int)ty;
-    cydTransformTouch(x, y);  // no-op unless the Settings screen's touch-fix value is non-zero
+  uint16_t rx, ry;
+  if (!cydReadRawTouch(rx, ry)) return;
+  lastCydTouchAt = millis();
 
-    // Always logged, every touch, on every screen. Open the serial monitor
-    // (115200) and tap the four physical corners of the glass: if the
-    // reported coordinates don't run from roughly 0,0 to SCREEN_W-1,
-    // SCREEN_H-1, then the panel extent the firmware is using does not
-    // match the real display - which is measurable here instead of being
-    // inferred from how the layout looks.
-    Serial.printf("TOUCH raw=(%ld,%ld) mapped=(%d,%d) screen=%dx%d rot=%u touchfix=%u screen_id=%d\n",
-                  (long)tx, (long)ty, x, y, SCREEN_W, SCREEN_H,
-                  (unsigned)cydRotation, (unsigned)cydTouchRotation, (int)currentCydScreen);
+  // raw ADC -> screen, using the ranges measured on this hardware
+  long x = map(rx, CYD_RAW_X_MIN, CYD_RAW_X_MAX, 0, SCREEN_W - 1);
+  long y = map(ry, CYD_RAW_Y_MIN, CYD_RAW_Y_MAX, 0, SCREEN_H - 1);
+  int sx = constrain(x, 0, SCREEN_W - 1);
+  int sy = constrain(y, 0, SCREEN_H - 1);
+  cydTransformTouch(sx, sy);   // applies the swap/invert bits (default: invert Y)
 
-    cydHandleTouch(x, y);
-  }
+  Serial.printf("TOUCH raw=(%u,%u) -> (%d,%d) screen=%dx%d rot=%u fix=%u scr=%d\n",
+                rx, ry, sx, sy, SCREEN_W, SCREEN_H,
+                (unsigned)cydRotation, (unsigned)cydTouchRotation, (int)currentCydScreen);
+
+  cydHandleTouch(sx, sy);
 }
 
-// One-time visual diagnostic, shown right before the very first
-// calibration: four colored, labeled quadrants plus a white border drawn
-// at exactly the declared screen extent (0,0)-(SCREEN_W-1,SCREEN_H-1). If
-// the real panel is a different resolution than assumed, or mirrored, or
-// only partially addressable, this makes it visible in one look instead of
-// guessing config values one at a time - e.g. if the border doesn't reach
-// a physical edge, that edge's dimension is wrong; if "TL" shows up in a
-// different physical corner than top-left, that's the rotation/mirror to
-// fix; a quadrant that stays whatever color it was before (not updating)
-// is the "partial screen doesn't clear" symptom, localized to a specific
-// corner instead of a vague fraction.
-void cydRunDiagnostic() {
-  tft.startWrite();
-  int halfW = SCREEN_W / 2, halfH = SCREEN_H / 2;
-  tft.fillRect(0, 0, halfW, halfH, TFT_RED);
-  tft.fillRect(halfW, 0, SCREEN_W - halfW, halfH, TFT_GREEN);
-  tft.fillRect(0, halfH, halfW, SCREEN_H - halfH, TFT_BLUE);
-  tft.fillRect(halfW, halfH, SCREEN_W - halfW, SCREEN_H - halfH, TFT_YELLOW);
-  tft.drawRect(0, 0, SCREEN_W, SCREEN_H, TFT_WHITE);
-  tft.drawRect(1, 1, SCREEN_W - 2, SCREEN_H - 2, TFT_WHITE);  // doubled so a 1px border is easy to spot
-
-  // Corner labels are anchored with an explicit datum per corner rather
-  // than hand-computed pixel offsets - the previous version subtracted
-  // guessed label widths (SCREEN_W - 74) and inherited whatever text datum
-  // the last draw happened to leave set, so the right-hand labels could
-  // land wrong or overhang the edge entirely.
-  tft.setFont(&fonts::FreeSansBold9pt7b);
-  tft.setTextColor(TFT_WHITE);
-  tft.setTextDatum(textdatum_t::top_left);
-  tft.drawString("TL", 6, 6);
-  tft.setTextDatum(textdatum_t::top_right);
-  tft.drawString("TR", SCREEN_W - 6, 6);
-  tft.setTextDatum(textdatum_t::bottom_left);
-  tft.drawString("BL", 6, SCREEN_H - 6);
-  tft.setTextDatum(textdatum_t::bottom_right);
-  tft.drawString("BR", SCREEN_W - 6, SCREEN_H - 6);
-
-  // What the firmware believes the panel is. If these numbers disagree
-  // with the physical glass, that is the bug - and it's readable straight
-  // off the screen instead of being inferred from how the layout looks.
-  tft.setTextDatum(textdatum_t::middle_center);
-  tft.setFont(&fonts::FreeSansBold12pt7b);
-  tft.setTextColor(TFT_BLACK);
-  tft.drawString(String(SCREEN_W) + " x " + String(SCREEN_H), SCREEN_W / 2, SCREEN_H / 2 - 14);
-  tft.drawString("rot " + String(cydRotation), SCREEN_W / 2, SCREEN_H / 2 + 14);
-  tft.setTextDatum(textdatum_t::top_left);
-  tft.endWrite();
-
-  Serial.printf("CYD diagnostic: SCREEN_W=%d SCREEN_H=%d rotation=%u\n",
-                SCREEN_W, SCREEN_H, (unsigned)cydRotation);
-  delay(6000);  // watchdog isn't armed yet at this point in setup() - safe to block here
-}
-
-// Touch calibration doesn't need to run every boot - save whatever
-// calibrateTouch() produces once, and load it back on subsequent boots via
-// setTouchCalibrate() (LGFX's "apply already-known calibration" companion
-// to calibrateTouch()) instead of re-running the interactive crosshair UI.
-bool cydLoadTouchCalib(uint16_t *calibData) {
-  if (!LittleFS.exists(CYD_CALIB_PATH)) return false;
-  File f = LittleFS.open(CYD_CALIB_PATH, "r");
-  if (!f) return false;
-  size_t n = f.read((uint8_t*)calibData, sizeof(uint16_t) * 8);
-  f.close();
-  return n == sizeof(uint16_t) * 8;
-}
-
-void cydSaveTouchCalib(const uint16_t *calibData) {
-  File f = LittleFS.open(CYD_CALIB_PATH, "w");
-  if (!f) return;
-  f.write((const uint8_t*)calibData, sizeof(uint16_t) * 8);
-  f.close();
-}
-
-// /cydrecalibrate - clears the saved calibration and reboots into the
-// interactive crosshair UI again. Useful after changing CYD_ROTATION (old
-// calibration data doesn't necessarily still line up) or if touch just
-// starts feeling off.
-void handleCydRecalibrate() {
-  LittleFS.remove(CYD_CALIB_PATH);
-  server.send(200, "text/plain", "Calibration cleared - rebooting to recalibrate. Point at the crosshairs on the screen after it restarts.");
-  delay(300);
-  ESP.restart();
-}
 
 #endif  // BOARD_CYD
 
@@ -3242,11 +3175,12 @@ void setup() {
   Serial.begin(115200);
   delay(500);
 
-#ifndef BOARD_CYD
-  initWatchdog();  // arm early so a hang anywhere in setup() is also caught
-#endif
-  // CYD arms it further down instead, after touch calibration - see the
-  // comment there for why.
+  // Armed early on both boards so a hang anywhere in setup() is caught.
+  // (CYD used to defer this because the old interactive touch calibration
+  // blocked here waiting for taps and tripped the watchdog mid-way. There
+  // is no calibration step any more - the touch range is a measured
+  // constant - so nothing in setup() blocks on a human.)
+  initWatchdog();
 
   // sensible defaults before loadProfile() has a chance to override them
   // with anything actually saved - otherwise an un-customized slot would
@@ -3276,11 +3210,12 @@ void setup() {
   // so orientation can be fixed without a re-flash.
   cydLoadDisplaySettings();
   cydApplyRotation();      // also refreshes SCREEN_W/SCREEN_H from the panel
-  // a new firmware upload always starts from a fresh calibration
-  if (cydFirmwareChanged()) {
-    Serial.println("New firmware detected - clearing saved touch calibration");
-    LittleFS.remove(CYD_CALIB_PATH);
-  }
+
+  // touch: direct XPT2046 on its own HSPI instance, no calibration step
+  pinMode(T_CS, OUTPUT);
+  digitalWrite(T_CS, HIGH);
+  pinMode(T_IRQ, INPUT);
+  touchSPI.begin(T_CLK, T_MISO, T_MOSI, T_CS);
 #else
   tft.setRotation(0);
   SCREEN_W = tft.width();
@@ -3290,31 +3225,6 @@ void setup() {
   tft.setBrightness(SCREEN_BRIGHTNESS);
   tft.fillScreen(TFT_BLACK);
 
-#ifdef BOARD_CYD
-  // Touch calibration: load a previously-saved result if there is one:
-  // interactive crosshairs (LGFX's built-in helper, not a hand-rolled
-  // 2-point tap UI) only run on the very first boot, or after /cydrecalibrate
-  // clears the saved file.
-  //
-  // The watchdog is NOT armed yet at this point (see setup()'s start) -
-  // calibrateTouch() blocks waiting for real taps with no way for this code
-  // to feed the watchdog while it's waiting (it's one opaque library call,
-  // not a loop this code controls), and a first-time calibration taking
-  // longer than the watchdog's timeout is completely normal, not a hang.
-  // Arming the watchdog before this point was resetting the board mid-
-  // calibration. It's armed right after instead, once every remaining step
-  // in setup() is either fast or already feeds it explicitly (the WiFi
-  // retry loop below does).
-  uint16_t cydCalibData[8];
-  if (!cydLoadTouchCalib(cydCalibData)) {
-    cydRunDiagnostic();
-    tft.calibrateTouch(cydCalibData, TFT_WHITE, TFT_BLACK, 20);
-    cydSaveTouchCalib(cydCalibData);
-  } else {
-    tft.setTouchCalibrate(cydCalibData);
-  }
-  initWatchdog();
-#endif
 
   updateScreen("Booting...");
 
@@ -3365,9 +3275,6 @@ void setup() {
   server.on("/remote/columns", handleRemoteColumns);
   server.on("/trylookup", handleTryLookup);
   server.on("/savelookupcode", handleSaveLookupCode);
-#ifdef BOARD_CYD
-  server.on("/cydrecalibrate", handleCydRecalibrate);
-#endif
   server.begin();
 
   updateScreen("Ready");

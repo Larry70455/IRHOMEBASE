@@ -40,17 +40,30 @@
 // compose (offset_rotation is a baked-in pre-rotation, setRotation() is
 // added on top), so driving both off the same constant would have doubled
 // up and only reached half the possible states.
-// Both of these are only the power-on DEFAULTS now - the on-device
-// Settings screen changes them live and saves the result, so neither
-// normally needs editing here.
-#define CYD_ROTATION 4
-// Touch axis fix, applied in software by cydTransformTouch() in main.cpp
-// (bit0 = invert X, bit1 = invert Y, bit2 = swap X/Y). The panel's own
-// touch offset_rotation below is left at 0 so this is the single place
-// that controls touch orientation - two independent corrections applied to
-// the same coordinates would just fight each other. Only needed if taps
-// land somewhere other than where you actually press.
-#define CYD_TOUCH_ROTATION 0
+// Both of these are only the power-on DEFAULTS - the on-device Settings
+// screen changes them live and saves the result, so neither normally needs
+// editing here.
+//
+// 5 was measured on this hardware with debug/cyd_touch_debug.cpp: it gives
+// an upright, unmirrored 240x320 portrait canvas from the 320x240 panel.
+#define CYD_ROTATION 5
+// Touch axis fix applied in software by cydTransformTouch() in main.cpp
+// (bit0 = invert X, bit1 = invert Y, bit2 = swap X/Y). 2 = invert Y only,
+// which is what the same measurement produced (axes not swapped, X not
+// inverted, Y inverted).
+#define CYD_TOUCH_ROTATION 2
+
+// Raw XPT2046 ADC range, measured on this hardware by tapping the four
+// corner targets in the debug sketch. Touch is read directly (see the
+// XPT2046 section in main.cpp) and mapped through these, rather than going
+// through LovyanGFX's touch layer and its calibrate/store cycle - a stored
+// calibration that came out wrong was what previously made the on-device
+// settings screen unreachable, and there is no need for one when the real
+// range is known.
+#define CYD_RAW_X_MIN 345
+#define CYD_RAW_X_MAX 3756
+#define CYD_RAW_Y_MIN 382
+#define CYD_RAW_Y_MAX 3600
 
 // Two CYD hardware variants exist with the SAME pins but DIFFERENT display
 // controllers - the reference project ships two separate display configs
@@ -72,7 +85,6 @@ class LGFX : public lgfx::LGFX_Device {
 #endif
   lgfx::Bus_SPI _bus_instance;
   lgfx::Light_PWM _light_instance;
-  lgfx::Touch_XPT2046 _touch_instance;
 
 public:
   LGFX(void) {
@@ -127,27 +139,12 @@ public:
       _panel_instance.setLight(&_light_instance);
     }
 
-    {
-      // Separate SPI bus from the panel above - genuinely different pins,
-      // not a shared bus with a second chip-select, so bus_shared is false
-      // and this gets its own spi_host.
-      auto cfg = _touch_instance.config();
-      cfg.x_min = 0;
-      cfg.x_max = 4095;
-      cfg.y_min = 0;
-      cfg.y_max = 4095;
-      cfg.pin_int  = 36;
-      cfg.pin_sclk = 25;
-      cfg.pin_mosi = 32;
-      cfg.pin_miso = 39;
-      cfg.pin_cs   = 33;
-      cfg.spi_host = HSPI_HOST;
-      cfg.freq = 1000000;
-      cfg.bus_shared = false;
-      cfg.offset_rotation = 0;  // fixed - touch orientation is handled by cydTransformTouch() in main.cpp, see above
-      _touch_instance.config(cfg);
-      _panel_instance.setTouch(&_touch_instance);
-    }
+    // No touch instance is attached here on purpose. Touch is read
+    // directly from the XPT2046 in main.cpp (its own HSPI instance on pins
+    // 25/32/39/33, IRQ 36) and mapped with the measured raw ranges above.
+    // Attaching LovyanGFX's touch driver as well would put two owners on
+    // the same HSPI bus and chip-select, and would reintroduce the
+    // calibrate-and-store cycle this deliberately avoids.
 
     setPanel(&_panel_instance);
   }
