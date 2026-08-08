@@ -34,11 +34,11 @@
 #define LV_USE_MEM_MONITOR 0
 #define LV_USE_LOG 0
 
-// Fonts actually referenced by the C3 UI. Each one costs flash, so this is
-// deliberately a short list rather than "enable everything".
+// Fonts actually referenced by the C3 UI. Each one costs real flash - 28
+// was enabled here and used nowhere, which is pure waste in an image that
+// was linking at 99.7% of its partition.
 #define LV_FONT_MONTSERRAT_14 1
 #define LV_FONT_MONTSERRAT_20 1
-#define LV_FONT_MONTSERRAT_28 1
 #define LV_FONT_MONTSERRAT_48 1
 #define LV_FONT_DEFAULT &lv_font_montserrat_14
 
