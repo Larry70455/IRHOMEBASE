@@ -50,6 +50,11 @@
   #define RECV_PIN 4
   #define SEND_PIN 4
   #define HAS_WS2812 0
+  // Onboard addressable RGB LED. Free again now that IR lives entirely on
+  // IO4, and used here as a hardware status light so learn/blast
+  // confirmation is visible without looking at the screen. HAS_WS2812
+  // stays 0: that flag means the 8-LED slot strip, which this isn't.
+  #define C3_RGB_PIN 8
   // rotary encoder: the entire input device on this board
   #define ENC_A_PIN  10
   #define ENC_B_PIN  6
@@ -4122,19 +4127,41 @@ void c3NoteStatus(const String &status) {
   if (c3StatusLabel) lv_label_set_text(c3StatusLabel, c3Status.c_str());
 }
 
-// flashLeds() equivalent: briefly recolours the ring instead of an LED,
-// reverting non-blocking from loop() exactly like the other boards.
+// Onboard RGB LED on IO8. Registered lazily so nothing touches the pin
+// until there's actually something to show. Deliberately dim: a WS2812 at
+// full output on a desk device is unpleasant to sit next to.
+CRGB c3Rgb[1];
+bool c3RgbReady = false;
+
+void c3RgbSet(CRGB c) {
+  if (!c3RgbReady) {
+    FastLED.addLeds<WS2812, C3_RGB_PIN, GRB>(c3Rgb, 1);
+    FastLED.setBrightness(50);
+    c3RgbReady = true;
+  }
+  c3Rgb[0] = c;
+  FastLED.show();
+}
+
+// flashLeds() equivalent: drives the onboard RGB LED and tints the ring,
+// reverting non-blocking from loop() exactly like the other boards. The
+// colours carry the same meaning as the S3's LED strip - yellow learning,
+// green learned, blue blasted, orange nothing-to-do.
 void c3FlashAccent(CRGB color, int ms) {
+  // LED first and unconditionally: it's the one piece of feedback that
+  // works before the UI exists (early boot) and while looking away.
+  c3RgbSet(color);
+  c3FlashActive = true;
+  c3FlashUntil = millis() + ms;
   if (!c3Arc) return;
   c3FlashColor = lv_color_make(color.r, color.g, color.b);
   lv_obj_set_style_arc_color(c3Arc, c3FlashColor, LV_PART_INDICATOR);
-  c3FlashActive = true;
-  c3FlashUntil = millis() + ms;
 }
 
 void c3CheckFlashRevert() {
   if (c3FlashActive && millis() >= c3FlashUntil) {
     c3FlashActive = false;
+    c3RgbSet(CRGB::Black);
     if (c3Arc) {
       lv_obj_set_style_arc_color(c3Arc,
         lv_color_make(accentColor.r, accentColor.g, accentColor.b), LV_PART_INDICATOR);
