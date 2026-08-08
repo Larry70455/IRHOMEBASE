@@ -14,6 +14,7 @@
 #include <utility>
 #include <ctype.h>
 #include <SPI.h>   // CYD reads the XPT2046 touch controller directly over its own SPI instance
+#include <esp_task_wdt.h>  // used by the watchdog section and by /irtest's transmit loop
 
 // Board selection is set at the build-system level: platformio.ini's
 // [env:cyd] passes -D BOARD_CYD, [env:esp32-s3-devkitm-1] doesn't. Every
@@ -351,6 +352,16 @@ void sendCode(const IRCode &code) {
 
   suppressReceive = true;
   IrReceiver.stop();
+
+#ifdef BOARD_C3KNOB
+  // RX and TX share IO4 here, and both IrReceiver.begin() and the tail of
+  // this function leave that pin an INPUT. Claim it as an output
+  // explicitly rather than relying on IRremote's carrier setup to flip it
+  // for us - if that assumption is ever wrong the symptom is simply
+  // nothing being transmitted, with no error anywhere.
+  pinMode(SEND_PIN, OUTPUT);
+  digitalWrite(SEND_PIN, LOW);
+#endif
 
   if (isProtocolEncoded) {
     Serial.printf("Sending %s code, address=%u command=%u\n",
@@ -2648,6 +2659,53 @@ void handleRemoteColumns() {
   finishRequest();
 }
 
+// /irtest[?secs=N] - transmits continuously for a few seconds so the IR
+// LED can be checked with a phone camera (phone sensors see IR; eyes
+// don't). This is the fastest way to split "the firmware isn't sending"
+// from "the emitter isn't lit" from "it's lit but the target ignores it",
+// which is otherwise guesswork.
+void handleIrTest() {
+  int secs = server.hasArg("secs") ? server.arg("secs").toInt() : 3;
+  if (secs < 1) secs = 1;
+  if (secs > 10) secs = 10;   // capped: this blocks the loop while it runs
+
+  Serial.printf("IR test: transmitting for %ds on pin %d\n", secs, SEND_PIN);
+  updateScreen("IR test blasting");
+
+  unsigned long until = millis() + (unsigned long)secs * 1000UL;
+  int frames = 0;
+  while (millis() < until) {
+    esp_task_wdt_reset();      // this loop can outrun the watchdog otherwise
+    suppressReceive = true;
+    IrReceiver.stop();
+#ifdef BOARD_C3KNOB
+    pinMode(SEND_PIN, OUTPUT);
+    digitalWrite(SEND_PIN, LOW);
+#endif
+    IrSender.sendNEC(0x0707, 0x02, 0);   // arbitrary well-formed NEC frame
+    frames++;
+    delay(40);
+  }
+#ifdef BOARD_C3KNOB
+  pinMode(RECV_PIN, INPUT);    // hand the shared pin back to the receiver
+#endif
+  IrReceiver.restartTimer();
+  IrReceiver.resume();
+  suppressReceive = false;
+
+  Serial.printf("IR test: sent %d frames\n", frames);
+  updateScreen("IR test done");
+
+  String out = "Sent " + String(frames) + " NEC frames over " + String(secs) + "s on GPIO" + String(SEND_PIN) + ".\n\n";
+  out += "Point a phone camera at the IR LED while this runs - a working\n";
+  out += "emitter shows as a flickering pale/purple dot on the screen.\n\n";
+  out += "Lit  -> the emitter works; the target device just isn't accepting\n";
+  out += "        this code (wrong protocol/brand, or out of range/angle).\n";
+  out += "Dark -> nothing is reaching the LED: check the jumper, the LED\n";
+  out += "        polarity, and that RX isn't loading the line (see below).\n";
+  server.send(200, "text/plain", out);
+}
+
 // ---------- multiple remotes ----------
 // /remotes/add?name=X - creates an empty remote and switches to it
 void handleRemotesAdd() {
@@ -3102,7 +3160,6 @@ void handleWifiWatchdog() {
 // this with real margin, or the watchdog would fire mid-boot on a slow
 // start and reset the device before it ever reaches loop(), which would be
 // a boot-crash-loop every time WiFi just happens to be unreachable.
-#include <esp_task_wdt.h>
 #define WDT_TIMEOUT_S 25
 
 void initWatchdog() {
@@ -4521,6 +4578,7 @@ void setup() {
   server.on("/remote/learn", handleRemoteLearnButton);
   server.on("/remote/teachall", handleRemoteTeachAll);
   server.on("/remote/teachstop", handleRemoteTeachStop);
+  server.on("/irtest", handleIrTest);
   server.on("/remotes/add", handleRemotesAdd);
   server.on("/remotes/select", handleRemotesSelect);
   server.on("/remotes/rename", handleRemotesRename);
