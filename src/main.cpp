@@ -20,7 +20,10 @@
 // hardware difference between the two boards branches off this one flag
 // (or HAS_WS2812 below, which follows from it) rather than a scattered set
 // of ad-hoc checks.
-#ifdef BOARD_CYD
+#if defined(BOARD_C3KNOB)
+  #include "LGX_Config_C3.h"
+  #include <lvgl.h>
+#elif defined(BOARD_CYD)
   #include "LGX_Config_CYD.h"
 #else
   #include "LGX_Config.h"
@@ -33,7 +36,24 @@
 // further down). IR receive/transmit run directly off GPIO22/GPIO27,
 // broken out on CYD's CN1 header and confirmed free/unclaimed by the
 // display, touch, RGB LED, speaker, SD card, or light sensor circuitry.
-#ifdef BOARD_CYD
+#if defined(BOARD_C3KNOB)
+  // ESP32-C3-LCDkit. Receive AND transmit both sit on IO4, which is how
+  // the board wires its IR hardware (jumpered externally). Driving TX from
+  // IO8 instead was tried and abandoned: IO8 also feeds the onboard
+  // addressable RGB LED, and sharing that pin between the IR carrier and a
+  // WS2812 did not work out.
+  //
+  // Sharing one pin means the direction has to be handed back and forth:
+  // transmitting leaves it an output, so sendCode() returns it to an input
+  // afterwards or the receiver goes deaf. See the end of sendCode().
+  #define RECV_PIN 4
+  #define SEND_PIN 4
+  #define HAS_WS2812 0
+  // rotary encoder: the entire input device on this board
+  #define ENC_A_PIN  10
+  #define ENC_B_PIN  6
+  #define ENC_SW_PIN 9
+#elif defined(BOARD_CYD)
   #define RECV_PIN 22
   #define SEND_PIN 27
   #define HAS_WS2812 0
@@ -45,6 +65,17 @@
   #define HAS_WS2812 1
   #define LEARN_BTN_PIN 19
   #define BLAST_BTN_PIN 20
+#endif
+
+// Capability flag rather than another board-name test at every site: both
+// the CYD and the C3 knob replace the dedicated learn/blast buttons and
+// the 8-LED slot strip with their own UI, so "#ifndef BOARD_CYD" was
+// already the wrong question - it silently included S3-only code on any
+// future board.
+#if defined(BOARD_CYD) || defined(BOARD_C3KNOB)
+  #define HAS_PHYSICAL_BUTTONS 0
+#else
+  #define HAS_PHYSICAL_BUTTONS 1
 #endif
 
 // One slot per LED on the original board; on CYD there's no LED strip or
@@ -332,6 +363,26 @@ void sendCode(const IRCode &code) {
   }
 
   delay(40); // let the IR line settle
+
+#ifdef BOARD_C3KNOB
+  // RX and TX share IO4 on this board. Transmitting leaves the pin
+  // attached to IRremote's LEDC channel and configured as an output, so it
+  // has to be released and turned back into an input - otherwise the
+  // receiver sees nothing and learning silently never works again after
+  // the first blast. IRremote reconfigures the pin on every send
+  // (enableIROut -> timerConfigForSend), so taking it back here doesn't
+  // break the next transmission.
+  //
+  // The detach call was renamed in Arduino core 3.x - same version split
+  // this file already handles in initWatchdog().
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcDetach(SEND_PIN);
+#else
+  ledcDetachPin(SEND_PIN);
+#endif
+  pinMode(RECV_PIN, INPUT);
+#endif
+
   IrReceiver.restartTimer();
   IrReceiver.resume();
   suppressReceive = false;
@@ -477,6 +528,14 @@ void cydDrawStatusBar(const String &status);
 void cydTintBanner(CRGB color, int ms);
 void cydCheckBannerTintRevert();
 #endif
+#ifdef BOARD_C3KNOB
+// Same pattern as the CYD wrappers above: the knob UI lives near the
+// bottom of the file but these are called from updateScreen()/flashLeds(),
+// which are defined here.
+void c3NoteStatus(const String &status);
+void c3FlashAccent(CRGB color, int ms);
+void c3CheckFlashRevert();
+#endif
 
 void updateScreen(String status) {
   lastStatus = status;
@@ -486,7 +545,12 @@ void updateScreen(String status) {
     tft.setBrightness(SCREEN_BRIGHTNESS);
   }
 
-#ifdef BOARD_CYD
+#if defined(BOARD_C3KNOB)
+  // The knob UI is LVGL-managed: this must not draw over it directly.
+  // Hand the text to the UI layer, which puts it in its own status label
+  // and lets LVGL repaint on its own schedule.
+  c3NoteStatus(status);
+#elif defined(BOARD_CYD)
   // CYD's screen is a Home/Learn touch GUI, not this board's fixed status
   // layout - only the persistent banner strip (shared across every CYD
   // screen) needs repainting here. A full-screen redraw on every status
@@ -550,6 +614,8 @@ void flashLeds(CRGB color, int ms) {
   FastLED.show();
   ledFlashActive = true;
   ledFlashUntil = millis() + ms;
+#elif defined(BOARD_C3KNOB)
+  c3FlashAccent(color, ms);
 #else
   cydTintBanner(color, ms);
 #endif
@@ -2850,7 +2916,7 @@ void handleSaveLookupCode() {
 // CYD has neither dedicated buttons nor an LED strip - this entire section
 // is specific to the original board (see BOARD_CYD's touch-screen Home/
 // Learn screens further down for its equivalent).
-#ifndef BOARD_CYD
+#if HAS_PHYSICAL_BUTTONS
 // Button 1 fires whichever slot is selected. Button 2 short-press cycles
 // slots; held past LONG_PRESS_MS it learns into the current slot instead,
 // overwriting whatever was there - no confirmation, since there's no screen
@@ -2910,8 +2976,8 @@ void updateSlotLeds() {
 // as several presses and releases for what was physically one press - the
 // likely cause of "weird stuff happening" on button 2 in particular, since
 // its state machine tracks edges (press/release/hold), not just a level.
-// CYD equivalent: touch polling debounce in loop() (see BOARD_CYD section).
-#ifndef BOARD_CYD
+// Touch/knob boards debounce their own input instead (see their sections).
+#if HAS_PHYSICAL_BUTTONS
 const unsigned long DEBOUNCE_MS = 25;
 
 bool debounceButton(int pin, int &lastRaw, unsigned long &lastChangeAt, bool &stable) {
@@ -2980,7 +3046,7 @@ void handlePhysicalButtons() {
     }
   }
 }
-#endif  // !BOARD_CYD (physical control section)
+#endif  // HAS_PHYSICAL_BUTTONS (physical control section)
 
 // ---------- WiFi reconnect watchdog ----------
 // WiFi.begin() only kicks off a connection attempt - it doesn't block
@@ -3855,9 +3921,491 @@ void handleCydDisplay() {
 
 #endif  // BOARD_CYD
 
+// ============================================================================
+// ESP32-C3-LCDkit: round 240x240 GC9A01 + rotary encoder, LVGL UI
+// ============================================================================
+// Input is one knob: rotate to move, short press to act, long press to go
+// back / open the menu. There is no touch and no keyboard, so every screen
+// is a single scrollable list of choices - nothing needs a pointer.
+//
+// LVGL is used for rendering only. Selection is driven from the encoder
+// directly rather than through an LVGL input device and focus groups: the
+// group/focus semantics add a lot of behaviour that has to be reasoned
+// about blind, and doing it by hand keeps "which item is selected" a plain
+// integer this code owns.
+#ifdef BOARD_C3KNOB
+
+// --- LVGL plumbing ---
+// Partial draw buffer. 240 x 40 x 2 bytes = ~19KB; a full framebuffer
+// would be 112KB, which this chip cannot spare alongside WiFi + web server.
+#define LV_C3_BUF_LINES 40
+static lv_disp_draw_buf_t c3DrawBuf;
+static lv_color_t c3Buf[240 * LV_C3_BUF_LINES];
+static lv_disp_drv_t c3DispDrv;
+
+static void c3FlushCb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_p) {
+  uint32_t w = area->x2 - area->x1 + 1;
+  uint32_t h = area->y2 - area->y1 + 1;
+  tft.startWrite();
+  tft.setAddrWindow(area->x1, area->y1, w, h);
+  tft.writePixels((lgfx::rgb565_t *)color_p, w * h);
+  tft.endWrite();
+  lv_disp_flush_ready(drv);
+}
+
+// --- rotary encoder ---
+// Quadrature decoded by sampling B on each falling edge of A. Coarse
+// compared to a full state-machine decoder, but these detented knobs give
+// one clean pulse per click and this cannot mis-count a detent into two.
+volatile int c3EncDelta = 0;
+int c3LastA = HIGH;
+unsigned long c3LastEncAt = 0;
+
+bool c3SwDown = false;
+unsigned long c3SwPressedAt = 0;
+bool c3SwLongFired = false;
+const unsigned long C3_LONG_PRESS_MS = 600;
+const unsigned long C3_ENC_MIN_GAP_MS = 5;   // contact-bounce floor
+
+// --- screens ---
+enum C3Screen { C3_HOME, C3_MENU, C3_REMOTES, C3_LEARN, C3_SCAN };
+C3Screen c3Screen = C3_HOME;
+int c3Sel = 0;               // selection index within the current screen
+int c3HomeSel = 0;           // Home's selection, preserved while in the menu
+int c3ScanIdx = 0;           // which brand the blind scan is sitting on
+
+lv_obj_t *c3ScrRoot = NULL;
+lv_obj_t *c3Arc = NULL;
+lv_obj_t *c3IconLabel = NULL;
+lv_obj_t *c3TitleLabel = NULL;
+lv_obj_t *c3SubLabel = NULL;
+lv_obj_t *c3StatusLabel = NULL;
+
+String c3Status = "";
+unsigned long c3FlashUntil = 0;
+lv_color_t c3FlashColor;
+bool c3FlashActive = false;
+
+// Baked-in power codes for the blind scan: when you have no idea what a
+// device speaks, step through these and press until something reacts.
+// Values are real IRDB entries (probonopd/irdb), not invented - and only
+// brands whose protocol this firmware can actually transmit are listed.
+// Sharp and TCL were dropped for that reason: their IRDB entries use the
+// Sharp and RCA-38 protocols, which isProtocolSupported() rejects, so
+// including them would just produce buttons that silently do nothing.
+struct ScanCode {
+  const char *brand;
+  const char *protocol;
+  int device;
+  int subdevice;
+  int function;
+};
+const ScanCode C3_SCAN_CODES[] = {
+  { "Samsung",  "NECx2",     7,   7, 2  },
+  { "LG",       "NEC1",      1,   1, 28 },
+  { "Sony",     "Sony12",    1,  -1, 21 },
+  { "Panasonic","Panasonic", 128, 0, 61 },
+  { "Philips",  "RC5",       0,  -1, 12 },
+  { "Toshiba",  "NEC1",      64, -1, 18 },
+};
+const int C3_SCAN_COUNT = sizeof(C3_SCAN_CODES) / sizeof(C3_SCAN_CODES[0]);
+
+const char *C3_MENU_ITEMS[] = { "Remotes", "Teach all", "Learn this", "IR scan", "Back" };
+const int C3_MENU_COUNT = 5;
+
+// Maps this project's icon ids onto LVGL's built-in symbol glyphs, so the
+// knob UI gets real icons without shipping image assets. Digits fall
+// through to plain text.
+const char *c3IconSymbol(uint8_t id, const char *fallback) {
+  switch (id) {
+    case ICON_UP:    return LV_SYMBOL_UP;
+    case ICON_DOWN:  return LV_SYMBOL_DOWN;
+    case ICON_LEFT:  return LV_SYMBOL_LEFT;
+    case ICON_RIGHT: return LV_SYMBOL_RIGHT;
+    case ICON_PLUS:  return LV_SYMBOL_PLUS;
+    case ICON_MINUS: return LV_SYMBOL_MINUS;
+    case ICON_CHECK: return LV_SYMBOL_OK;
+    case ICON_X:     return LV_SYMBOL_CLOSE;
+    case ICON_POWER: return LV_SYMBOL_POWER;
+    case ICON_WIFI:  return LV_SYMBOL_WIFI;
+    default: break;
+  }
+  if (id >= ICON_0 && id <= ICON_9) {
+    static char digit[2];
+    digit[0] = (char)('0' + (id - ICON_0));
+    digit[1] = 0;
+    return digit;
+  }
+  return fallback;
+}
+
+// Counts only real buttons - spacers exist for layout on the big screens
+// and would be dead stops when scrolling with a knob.
+int c3RealButtonCount() {
+  int n = 0;
+  for (auto &b : remoteButtons) if (!b.spacer) n++;
+  return n;
+}
+
+// nth non-spacer button -> index into remoteButtons, or -1
+int c3RealButtonIndex(int nth) {
+  int n = 0;
+  for (int i = 0; i < (int)remoteButtons.size(); i++) {
+    if (remoteButtons[i].spacer) continue;
+    if (n == nth) return i;
+    n++;
+  }
+  return -1;
+}
+
+void c3Render();
+
+void c3NoteStatus(const String &status) {
+  c3Status = status;
+  if (c3StatusLabel) lv_label_set_text(c3StatusLabel, c3Status.c_str());
+}
+
+// flashLeds() equivalent: briefly recolours the ring instead of an LED,
+// reverting non-blocking from loop() exactly like the other boards.
+void c3FlashAccent(CRGB color, int ms) {
+  if (!c3Arc) return;
+  c3FlashColor = lv_color_make(color.r, color.g, color.b);
+  lv_obj_set_style_arc_color(c3Arc, c3FlashColor, LV_PART_INDICATOR);
+  c3FlashActive = true;
+  c3FlashUntil = millis() + ms;
+}
+
+void c3CheckFlashRevert() {
+  if (c3FlashActive && millis() >= c3FlashUntil) {
+    c3FlashActive = false;
+    if (c3Arc) {
+      lv_obj_set_style_arc_color(c3Arc,
+        lv_color_make(accentColor.r, accentColor.g, accentColor.b), LV_PART_INDICATOR);
+    }
+  }
+}
+
+// One screen layout reused by every mode: a progress ring, a big centre
+// glyph, a title, a subtitle and a status line. Only the text and the ring
+// position change between screens, so there is a single place where the
+// round-panel geometry has to be right.
+void c3BuildUi() {
+  c3ScrRoot = lv_obj_create(NULL);
+  lv_obj_set_style_bg_color(c3ScrRoot, lv_color_black(), 0);
+  lv_obj_clear_flag(c3ScrRoot, LV_OBJ_FLAG_SCROLLABLE);
+
+  c3Arc = lv_arc_create(c3ScrRoot);
+  lv_obj_set_size(c3Arc, 232, 232);
+  lv_obj_center(c3Arc);
+  lv_arc_set_rotation(c3Arc, 270);
+  lv_arc_set_bg_angles(c3Arc, 0, 360);
+  lv_arc_set_range(c3Arc, 0, 100);
+  lv_arc_set_value(c3Arc, 0);
+  lv_obj_remove_style(c3Arc, NULL, LV_PART_KNOB);          // display only, not a control
+  lv_obj_clear_flag(c3Arc, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_style_arc_width(c3Arc, 8, LV_PART_MAIN);
+  lv_obj_set_style_arc_width(c3Arc, 8, LV_PART_INDICATOR);
+  lv_obj_set_style_arc_color(c3Arc, lv_color_hex(0x222222), LV_PART_MAIN);
+  lv_obj_set_style_arc_color(c3Arc,
+    lv_color_make(accentColor.r, accentColor.g, accentColor.b), LV_PART_INDICATOR);
+
+  c3IconLabel = lv_label_create(c3ScrRoot);
+  lv_obj_set_style_text_font(c3IconLabel, &lv_font_montserrat_48, 0);
+  lv_obj_set_style_text_color(c3IconLabel, lv_color_white(), 0);
+  lv_label_set_text(c3IconLabel, "");
+  lv_obj_align(c3IconLabel, LV_ALIGN_CENTER, 0, -28);
+
+  c3TitleLabel = lv_label_create(c3ScrRoot);
+  lv_obj_set_style_text_font(c3TitleLabel, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_color(c3TitleLabel, lv_color_white(), 0);
+  lv_label_set_long_mode(c3TitleLabel, LV_LABEL_LONG_DOT);
+  lv_obj_set_width(c3TitleLabel, 170);
+  lv_obj_set_style_text_align(c3TitleLabel, LV_TEXT_ALIGN_CENTER, 0);
+  lv_label_set_text(c3TitleLabel, "");
+  lv_obj_align(c3TitleLabel, LV_ALIGN_CENTER, 0, 24);
+
+  c3SubLabel = lv_label_create(c3ScrRoot);
+  lv_obj_set_style_text_font(c3SubLabel, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(c3SubLabel, lv_color_hex(0x9aa0a6), 0);
+  lv_label_set_long_mode(c3SubLabel, LV_LABEL_LONG_DOT);
+  lv_obj_set_width(c3SubLabel, 170);
+  lv_obj_set_style_text_align(c3SubLabel, LV_TEXT_ALIGN_CENTER, 0);
+  lv_label_set_text(c3SubLabel, "");
+  lv_obj_align(c3SubLabel, LV_ALIGN_CENTER, 0, 52);
+
+  c3StatusLabel = lv_label_create(c3ScrRoot);
+  lv_obj_set_style_text_font(c3StatusLabel, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(c3StatusLabel, lv_color_hex(0x5f6368), 0);
+  lv_label_set_long_mode(c3StatusLabel, LV_LABEL_LONG_DOT);
+  lv_obj_set_width(c3StatusLabel, 150);
+  lv_obj_set_style_text_align(c3StatusLabel, LV_TEXT_ALIGN_CENTER, 0);
+  lv_label_set_text(c3StatusLabel, "");
+  lv_obj_align(c3StatusLabel, LV_ALIGN_CENTER, 0, -74);
+
+  lv_scr_load(c3ScrRoot);
+}
+
+// Repaints the shared layout for whatever screen is current. Called on
+// every encoder move / press rather than diffing - at this size a full
+// text refresh is cheap and it keeps the logic obvious.
+void c3Render() {
+  if (!c3ScrRoot) return;
+  char buf[96];
+
+  if (c3Screen == C3_HOME) {
+    int total = c3RealButtonCount();
+    if (total == 0) {
+      lv_label_set_text(c3IconLabel, LV_SYMBOL_WARNING);
+      lv_label_set_text(c3TitleLabel, "No buttons");
+      lv_label_set_text(c3SubLabel, "Add them in the app");
+      lv_arc_set_value(c3Arc, 0);
+    } else {
+      if (c3Sel >= total) c3Sel = 0;
+      if (c3Sel < 0) c3Sel = total - 1;
+      int bi = c3RealButtonIndex(c3Sel);
+      RemoteButton &b = remoteButtons[bi];
+      String label = b.name.length() ? b.name : (b.codeName.length() ? b.codeName : String("(unnamed)"));
+      lv_label_set_text(c3IconLabel, c3IconSymbol(b.icon, LV_SYMBOL_PLAY));
+      lv_obj_set_style_text_color(c3IconLabel, lv_color_make(b.color.r, b.color.g, b.color.b), 0);
+      lv_label_set_text(c3TitleLabel, label.c_str());
+      snprintf(buf, sizeof(buf), "%d/%d  %s", c3Sel + 1, total,
+               b.codeName.length() ? "ready" : "no code");
+      lv_label_set_text(c3SubLabel, buf);
+      lv_arc_set_value(c3Arc, (int)((c3Sel + 1) * 100L / total));
+    }
+    lv_label_set_text(c3StatusLabel, remotes[currentRemote].name.c_str());
+
+  } else if (c3Screen == C3_MENU) {
+    if (c3Sel < 0) c3Sel = C3_MENU_COUNT - 1;
+    if (c3Sel >= C3_MENU_COUNT) c3Sel = 0;
+    lv_label_set_text(c3IconLabel, LV_SYMBOL_LIST);
+    lv_obj_set_style_text_color(c3IconLabel, lv_color_white(), 0);
+    lv_label_set_text(c3TitleLabel, C3_MENU_ITEMS[c3Sel]);
+    snprintf(buf, sizeof(buf), "%d/%d", c3Sel + 1, C3_MENU_COUNT);
+    lv_label_set_text(c3SubLabel, buf);
+    lv_arc_set_value(c3Arc, (int)((c3Sel + 1) * 100L / C3_MENU_COUNT));
+    lv_label_set_text(c3StatusLabel, "Menu");
+
+  } else if (c3Screen == C3_REMOTES) {
+    int total = (int)remotes.size();
+    if (c3Sel < 0) c3Sel = total - 1;
+    if (c3Sel >= total) c3Sel = 0;
+    lv_label_set_text(c3IconLabel, LV_SYMBOL_HOME);
+    lv_obj_set_style_text_color(c3IconLabel, lv_color_white(), 0);
+    lv_label_set_text(c3TitleLabel, remotes[c3Sel].name.c_str());
+    snprintf(buf, sizeof(buf), "%d/%d  %d buttons", c3Sel + 1, total,
+             (int)remotes[c3Sel].buttons.size());
+    lv_label_set_text(c3SubLabel, buf);
+    lv_arc_set_value(c3Arc, (int)((c3Sel + 1) * 100L / max(1, total)));
+    lv_label_set_text(c3StatusLabel, "Pick remote");
+
+  } else if (c3Screen == C3_LEARN) {
+    lv_label_set_text(c3IconLabel, LV_SYMBOL_DOWNLOAD);
+    lv_obj_set_style_text_color(c3IconLabel, lv_color_hex(0xffc107), 0);
+    lv_label_set_text(c3TitleLabel, "Point & press");
+    lv_label_set_text(c3SubLabel, teachAllActive ? "Teaching all" : "Learning one");
+    lv_arc_set_value(c3Arc, 100);
+    lv_label_set_text(c3StatusLabel, c3Status.c_str());
+
+  } else if (c3Screen == C3_SCAN) {
+    if (c3ScanIdx < 0) c3ScanIdx = C3_SCAN_COUNT - 1;
+    if (c3ScanIdx >= C3_SCAN_COUNT) c3ScanIdx = 0;
+    lv_label_set_text(c3IconLabel, LV_SYMBOL_POWER);
+    lv_obj_set_style_text_color(c3IconLabel, lv_color_hex(0xff5252), 0);
+    lv_label_set_text(c3TitleLabel, C3_SCAN_CODES[c3ScanIdx].brand);
+    snprintf(buf, sizeof(buf), "%d/%d  press to try", c3ScanIdx + 1, C3_SCAN_COUNT);
+    lv_label_set_text(c3SubLabel, buf);
+    lv_arc_set_value(c3Arc, (int)((c3ScanIdx + 1) * 100L / C3_SCAN_COUNT));
+    lv_label_set_text(c3StatusLabel, "IR scan");
+  }
+}
+
+void c3ShowScreen(C3Screen s, int sel = 0) {
+  c3Screen = s;
+  c3Sel = sel;
+  c3Render();
+}
+
+// Fires the currently selected blind-scan brand. Built the same way the
+// web lookup path is, so it goes through the one sendCode() that already
+// knows which protocols are safe to transmit.
+void c3ScanBlast() {
+  const ScanCode &sc = C3_SCAN_CODES[c3ScanIdx];
+  IRCode code;
+  code.len = 0;
+  code.hash = 0;
+  code.protocol = sc.protocol;
+  String p = code.protocol;
+  p.toUpperCase();
+  if (p.indexOf("NEC") >= 0) {
+    code.address = (sc.subdevice >= 0)
+      ? (uint16_t)((sc.device & 0xFF) | ((sc.subdevice & 0xFF) << 8))
+      : (uint16_t)(sc.device & 0xFF);
+  } else {
+    code.address = (uint16_t)(sc.device & 0xFFFF);
+  }
+  code.command = (uint16_t)(sc.function & 0xFFFF);
+  sendCode(code);
+  updateScreen(String("Tried ") + sc.brand);
+}
+
+void c3OnRotate(int delta) {
+  if (c3Screen == C3_SCAN) c3ScanIdx += delta;
+  else c3Sel += delta;
+  c3Render();
+}
+
+void c3OnShortPress() {
+  if (c3Screen == C3_HOME) {
+    int bi = c3RealButtonIndex(c3Sel);
+    if (bi < 0) return;
+    if (remoteButtons[bi].codeName.length()) {
+      queueCodeSend(remoteButtons[bi].codeName);
+    } else {
+      updateScreen("No code - learn it");
+      flashLeds(CRGB::Orange, 200);
+    }
+
+  } else if (c3Screen == C3_MENU) {
+    switch (c3Sel) {
+      case 0: c3ShowScreen(C3_REMOTES, currentRemote); break;
+      case 1: {
+        int next = nextUntaughtButton(0);
+        if (next < 0) { updateScreen("Nothing to teach"); c3ShowScreen(C3_HOME); }
+        else { teachAllActive = true; if (startButtonLearn(next)) c3ShowScreen(C3_LEARN); }
+        break;
+      }
+      case 2: {
+        // "Learn this" means the button Home was showing - c3Sel now holds
+        // the menu position, so use the saved Home index instead
+        int bi = c3RealButtonIndex(c3HomeSel);
+        if (bi >= 0) { teachAllActive = false; if (startButtonLearn(bi)) c3ShowScreen(C3_LEARN); }
+        break;
+      }
+      case 3: c3ShowScreen(C3_SCAN); break;
+      default: c3ShowScreen(C3_HOME); break;
+    }
+
+  } else if (c3Screen == C3_REMOTES) {
+    currentRemote = c3Sel;
+    ensureRemoteValid();
+    markProfileDirty();
+    updateScreen("Remote: " + remotes[currentRemote].name);
+    c3HomeSel = 0;            // different remote, old index means nothing
+    c3ShowScreen(C3_HOME);
+
+  } else if (c3Screen == C3_SCAN) {
+    c3ScanBlast();
+
+  } else if (c3Screen == C3_LEARN) {
+    // pressing during a learn cancels it, matching Cancel on the touch UI
+    stopTeachAll("Learn cancelled");
+    c3ShowScreen(C3_HOME);
+  }
+}
+
+void c3OnLongPress() {
+  if (c3Screen == C3_HOME) { c3HomeSel = c3Sel; c3ShowScreen(C3_MENU); }
+  else if (c3Screen == C3_LEARN) { stopTeachAll("Learn cancelled"); c3ShowScreen(C3_HOME); }
+  else c3ShowScreen(C3_HOME);
+}
+
+void c3UiInit() {
+  lv_init();
+  lv_disp_draw_buf_init(&c3DrawBuf, c3Buf, NULL, 240 * LV_C3_BUF_LINES);
+  lv_disp_drv_init(&c3DispDrv);
+  c3DispDrv.hor_res = 240;
+  c3DispDrv.ver_res = 240;
+  c3DispDrv.flush_cb = c3FlushCb;
+  c3DispDrv.draw_buf = &c3DrawBuf;
+  lv_disp_drv_register(&c3DispDrv);
+
+  pinMode(ENC_A_PIN, INPUT_PULLUP);
+  pinMode(ENC_B_PIN, INPUT_PULLUP);
+  pinMode(ENC_SW_PIN, INPUT_PULLUP);
+  c3LastA = digitalRead(ENC_A_PIN);
+
+  c3BuildUi();
+  c3ShowScreen(C3_HOME);
+}
+
+// Polled from loop(): encoder, button, and LVGL's own timers. Nothing here
+// blocks - LVGL gets a millis()-derived tick rather than a hardware timer,
+// since the C3's timers are already spoken for by the IR stack.
+void c3Task() {
+  static unsigned long lastTick = 0;
+  unsigned long now = millis();
+  if (lastTick == 0) lastTick = now;
+  if (now != lastTick) {
+    lv_tick_inc(now - lastTick);
+    lastTick = now;
+  }
+
+  // encoder: act on A's falling edge, direction from B
+  int a = digitalRead(ENC_A_PIN);
+  if (a != c3LastA) {
+    if (a == LOW && now - c3LastEncAt > C3_ENC_MIN_GAP_MS) {
+      c3LastEncAt = now;
+      // if the screensaver blanked the panel, the first input only wakes
+      // it - otherwise you'd be scrolling or firing a code blind. Nothing
+      // else on this board could wake it, since the wake path lived in the
+      // CYD touch poll.
+      if (screenAsleep) {
+        screenAsleep = false;
+        lastActivityAt = now;
+        tft.setBrightness(SCREEN_BRIGHTNESS);
+      } else {
+        c3OnRotate(digitalRead(ENC_B_PIN) == HIGH ? 1 : -1);
+      }
+    }
+    c3LastA = a;
+  }
+
+  // switch: short vs long press, both firing once per physical press
+  bool down = (digitalRead(ENC_SW_PIN) == LOW);
+  if (down && !c3SwDown) {
+    c3SwDown = true;
+    c3SwPressedAt = now;
+    c3SwLongFired = false;
+  } else if (down && c3SwDown && !c3SwLongFired && now - c3SwPressedAt >= C3_LONG_PRESS_MS) {
+    c3SwLongFired = true;      // fires while still held, so it feels immediate
+    c3OnLongPress();
+  } else if (!down && c3SwDown) {
+    c3SwDown = false;
+    if (screenAsleep) {
+      screenAsleep = false;
+      lastActivityAt = now;
+      tft.setBrightness(SCREEN_BRIGHTNESS);
+    } else if (!c3SwLongFired) {
+      c3OnShortPress();
+    }
+  }
+
+  lv_timer_handler();
+}
+
+#endif  // BOARD_C3KNOB
+
+// Prints a numbered stage marker. When a board resets during boot the last
+// marker printed is the last stage that completed, which turns "it reboots
+// and says nothing" into a specific line of code.
+static void bootMark(const char *what) {
+  static int n = 0;
+  Serial.printf("[boot %d] %s\n", ++n, what);
+  Serial.flush();
+}
+
 void setup() {
   Serial.begin(115200);
+#ifdef BOARD_C3KNOB
+  // native USB CDC: give the host a moment to enumerate, otherwise the
+  // first prints (including any panic during early setup) are lost
+  unsigned long usbWait = millis();
+  while (!Serial && millis() - usbWait < 2000) delay(10);
+#endif
   delay(500);
+  Serial.println();
+  bootMark("serial up");
 
   // Armed early on both boards so a hang anywhere in setup() is caught.
   // (CYD used to defer this because the old interactive touch calibration
@@ -3882,15 +4430,20 @@ void setup() {
   }
   // covers a failed/absent load too - remotes must never be empty, since
   // the remoteButtons/remoteColumns accessors index into it unconditionally
+  bootMark("profile loaded");
   ensureRemoteValid();
 
-#ifndef BOARD_CYD
+#if HAS_PHYSICAL_BUTTONS
   pinMode(LEARN_BTN_PIN, INPUT_PULLUP);
   pinMode(BLAST_BTN_PIN, INPUT_PULLUP);
 #endif
 
   tft.init();
-#ifdef BOARD_CYD
+#if defined(BOARD_C3KNOB)
+  tft.setRotation(0);            // round 240x240, no rotation needed
+  SCREEN_W = tft.width();
+  SCREEN_H = tft.height();
+#elif defined(BOARD_CYD)
   // 0-7: 0-3 plain rotations, 4-7 the same but mirrored (backward text
   // needs a 4-7 value - see the notes in LGX_Config_CYD.h). A value saved
   // from the on-device Settings screen wins over the compile-time default,
@@ -3908,6 +4461,7 @@ void setup() {
   SCREEN_W = tft.width();
   SCREEN_H = tft.height();
 #endif
+  bootMark("display init");
   tft.setTextWrap(false);  // all text is measured/truncated manually - never let the library wrap
   tft.setBrightness(SCREEN_BRIGHTNESS);
   tft.fillScreen(TFT_BLACK);
@@ -3915,6 +4469,7 @@ void setup() {
 
   updateScreen("Booting...");
 
+  bootMark("IR init");
   IrReceiver.begin(RECV_PIN, DISABLE_LED_FEEDBACK);
   IrSender.begin(SEND_PIN);
 
@@ -3923,6 +4478,7 @@ void setup() {
   FastLED.setBrightness(50);
 #endif
 
+  bootMark("wifi begin");
   WiFi.begin(ssid, password);
   updateScreen("Connecting WiFi...");
   int tries = 0;
@@ -3974,11 +4530,17 @@ void setup() {
 #ifdef BOARD_CYD
   server.on("/cyddisplay", handleCydDisplay);
 #endif
+  bootMark("web server up");
   server.begin();
 
   updateScreen("Ready");
 #ifdef BOARD_CYD
   cydShowScreen(CYD_HOME);
+#endif
+#ifdef BOARD_C3KNOB
+  bootMark("lvgl init");
+  c3UiInit();
+  bootMark("ui ready");
 #endif
 }
 
@@ -3988,8 +4550,10 @@ void loop() {
   handleWifiWatchdog();
   handleMqtt();
 
-#ifndef BOARD_CYD
+#if HAS_PHYSICAL_BUTTONS
   handlePhysicalButtons();
+#elif defined(BOARD_C3KNOB)
+  c3Task();          // encoder poll + LVGL tick/timer
 #else
   cydHandleTouchPoll();
 #endif
@@ -4043,6 +4607,12 @@ void loop() {
       if (currentCydScreen == CYD_LEARN && !advanced) cydShowScreen(CYD_HOME);
       else if (advanced) cydDrawLearn();
 #endif
+#ifdef BOARD_C3KNOB
+      // without this the knob UI would sit on "Point & press" forever
+      // after a successful capture
+      if (c3Screen == C3_LEARN && !advanced) c3ShowScreen(C3_HOME, c3HomeSel);
+      else if (advanced) c3Render();
+#endif
     } else {
       // not learning - just note that a signal came in
       updateScreen("Signal seen");
@@ -4094,6 +4664,9 @@ void loop() {
 #ifdef BOARD_CYD
     if (currentCydScreen == CYD_LEARN) cydShowScreen(CYD_HOME);
 #endif
+#ifdef BOARD_C3KNOB
+    if (c3Screen == C3_LEARN) c3ShowScreen(C3_HOME, c3HomeSel);
+#endif
   }
 
 #if HAS_WS2812
@@ -4118,6 +4691,8 @@ void loop() {
       updateSlotLeds();
     }
   }
+#elif defined(BOARD_C3KNOB)
+  c3CheckFlashRevert();   // non-blocking counterpart to c3FlashAccent()
 #else
   cydCheckBannerTintRevert();  // non-blocking counterpart to cydTintBanner() - see CYD screen-manager section
   // clears the tap-highlight outline once it's been visible long enough
