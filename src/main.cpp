@@ -4360,9 +4360,26 @@ void c3Task() {
 
 #endif  // BOARD_C3KNOB
 
+// Prints a numbered stage marker. When a board resets during boot the last
+// marker printed is the last stage that completed, which turns "it reboots
+// and says nothing" into a specific line of code.
+static void bootMark(const char *what) {
+  static int n = 0;
+  Serial.printf("[boot %d] %s\n", ++n, what);
+  Serial.flush();
+}
+
 void setup() {
   Serial.begin(115200);
+#ifdef BOARD_C3KNOB
+  // native USB CDC: give the host a moment to enumerate, otherwise the
+  // first prints (including any panic during early setup) are lost
+  unsigned long usbWait = millis();
+  while (!Serial && millis() - usbWait < 2000) delay(10);
+#endif
   delay(500);
+  Serial.println();
+  bootMark("serial up");
 
   // Armed early on both boards so a hang anywhere in setup() is caught.
   // (CYD used to defer this because the old interactive touch calibration
@@ -4387,6 +4404,7 @@ void setup() {
   }
   // covers a failed/absent load too - remotes must never be empty, since
   // the remoteButtons/remoteColumns accessors index into it unconditionally
+  bootMark("profile loaded");
   ensureRemoteValid();
 
 #if HAS_PHYSICAL_BUTTONS
@@ -4417,6 +4435,7 @@ void setup() {
   SCREEN_W = tft.width();
   SCREEN_H = tft.height();
 #endif
+  bootMark("display init");
   tft.setTextWrap(false);  // all text is measured/truncated manually - never let the library wrap
   tft.setBrightness(SCREEN_BRIGHTNESS);
   tft.fillScreen(TFT_BLACK);
@@ -4424,6 +4443,7 @@ void setup() {
 
   updateScreen("Booting...");
 
+  bootMark("IR init");
   IrReceiver.begin(RECV_PIN, DISABLE_LED_FEEDBACK);
   IrSender.begin(SEND_PIN);
 
@@ -4432,6 +4452,7 @@ void setup() {
   FastLED.setBrightness(50);
 #endif
 
+  bootMark("wifi begin");
   WiFi.begin(ssid, password);
   updateScreen("Connecting WiFi...");
   int tries = 0;
@@ -4483,6 +4504,7 @@ void setup() {
 #ifdef BOARD_CYD
   server.on("/cyddisplay", handleCydDisplay);
 #endif
+  bootMark("web server up");
   server.begin();
 
   updateScreen("Ready");
@@ -4490,7 +4512,9 @@ void setup() {
   cydShowScreen(CYD_HOME);
 #endif
 #ifdef BOARD_C3KNOB
+  bootMark("lvgl init");
   c3UiInit();
+  bootMark("ui ready");
 #endif
 }
 
