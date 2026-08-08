@@ -357,6 +357,25 @@ void sendCode(const IRCode &code) {
   }
 
   delay(40); // let the IR line settle
+
+#ifdef BOARD_C3KNOB
+  // IO8 carries the IR carrier AND the board's onboard LED. IRremote
+  // leaves the pin attached to its LEDC channel when it's done, which can
+  // leave the LED lit after a transmission. Detach it and drive the pin
+  // low so the line - and therefore the LED - actually rests off.
+  // IRremote reconfigures the pin on every send (enableIROut ->
+  // timerConfigForSend), so taking it back here doesn't break the next one.
+  // the detach call was renamed in Arduino core 3.x - same version split
+  // this file already handles in initWatchdog()
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcDetach(SEND_PIN);
+#else
+  ledcDetachPin(SEND_PIN);
+#endif
+  pinMode(SEND_PIN, OUTPUT);
+  digitalWrite(SEND_PIN, LOW);
+#endif
+
   IrReceiver.restartTimer();
   IrReceiver.resume();
   suppressReceive = false;
