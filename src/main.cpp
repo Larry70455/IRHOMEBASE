@@ -37,11 +37,17 @@
 // broken out on CYD's CN1 header and confirmed free/unclaimed by the
 // display, touch, RGB LED, speaker, SD card, or light sensor circuitry.
 #if defined(BOARD_C3KNOB)
-  // ESP32-C3-LCDkit. The board normally shares one IR line on IO4 with a
-  // jumper picking RX or TX - which would make learn and blast mutually
-  // exclusive. IO8 is given up to carry TX instead so both work at once.
+  // ESP32-C3-LCDkit. Receive AND transmit both sit on IO4, which is how
+  // the board wires its IR hardware (jumpered externally). Driving TX from
+  // IO8 instead was tried and abandoned: IO8 also feeds the onboard
+  // addressable RGB LED, and sharing that pin between the IR carrier and a
+  // WS2812 did not work out.
+  //
+  // Sharing one pin means the direction has to be handed back and forth:
+  // transmitting leaves it an output, so sendCode() returns it to an input
+  // afterwards or the receiver goes deaf. See the end of sendCode().
   #define RECV_PIN 4
-  #define SEND_PIN 8
+  #define SEND_PIN 4
   #define HAS_WS2812 0
   // rotary encoder: the entire input device on this board
   #define ENC_A_PIN  10
@@ -330,33 +336,6 @@ void sendProtocolEncoded(const IRCode &code) {
   }
 }
 
-#ifdef BOARD_C3KNOB
-// IO8 drives both the IR carrier and the board's addressable RGB LED.
-// A WS2812 latches whatever it last decoded and holds it, so the garbage
-// it reads out of a 38kHz carrier stays lit indefinitely - just releasing
-// the pin low doesn't clear it, the part has to be sent a real frame.
-//
-// FastLED is already linked into this build (CRGB is used throughout), so
-// this uses it rather than hand-rolling WS2812 bit timing, which is
-// cycle-sensitive and would be far easier to get subtly wrong.
-//
-// Registering lazily rather than in setup(): IRremote reconfigures this
-// pin on every transmission, so there is no point owning it before the
-// first send. The two alternate - IRremote takes the pin via LEDC to
-// transmit, FastLED takes it back via RMT to blank the LED.
-CRGB c3SharedLed[1];
-bool c3SharedLedReady = false;
-
-void c3ClearSharedLed() {
-  if (!c3SharedLedReady) {
-    FastLED.addLeds<WS2812, SEND_PIN, GRB>(c3SharedLed, 1);
-    c3SharedLedReady = true;
-  }
-  c3SharedLed[0] = CRGB::Black;
-  FastLED.show();
-}
-#endif
-
 void sendCode(const IRCode &code) {
   bool isProtocolEncoded = code.protocol.length() > 0;
 
@@ -386,20 +365,22 @@ void sendCode(const IRCode &code) {
   delay(40); // let the IR line settle
 
 #ifdef BOARD_C3KNOB
-  // IO8 carries the IR carrier AND the board's onboard LED. IRremote
-  // leaves the pin attached to its LEDC channel when it's done, which can
-  // leave the LED lit after a transmission. Detach it and drive the pin
-  // low so the line - and therefore the LED - actually rests off.
-  // IRremote reconfigures the pin on every send (enableIROut ->
-  // timerConfigForSend), so taking it back here doesn't break the next one.
-  // the detach call was renamed in Arduino core 3.x - same version split
-  // this file already handles in initWatchdog()
+  // RX and TX share IO4 on this board. Transmitting leaves the pin
+  // attached to IRremote's LEDC channel and configured as an output, so it
+  // has to be released and turned back into an input - otherwise the
+  // receiver sees nothing and learning silently never works again after
+  // the first blast. IRremote reconfigures the pin on every send
+  // (enableIROut -> timerConfigForSend), so taking it back here doesn't
+  // break the next transmission.
+  //
+  // The detach call was renamed in Arduino core 3.x - same version split
+  // this file already handles in initWatchdog().
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
   ledcDetach(SEND_PIN);
 #else
   ledcDetachPin(SEND_PIN);
 #endif
-  c3ClearSharedLed();   // blank the RGB LED sharing this pin
+  pinMode(RECV_PIN, INPUT);
 #endif
 
   IrReceiver.restartTimer();
