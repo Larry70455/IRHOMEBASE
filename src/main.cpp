@@ -342,6 +342,78 @@ void sendProtocolEncoded(const IRCode &code) {
   }
 }
 
+#ifdef BOARD_C3KNOB
+// ---------- software IR carrier ----------
+// IRremote's hardware-PWM (LEDC) send path produces nothing on this chip.
+// Proved by experiment rather than inference: /irtest?mode=carrier, which
+// bit-bangs 38kHz by hand, lights the emitter; /irtest?mode=nec, which
+// goes through IRremote, does not - on the same pin, in the same run.
+// So the carrier is generated here instead and IRremote is used only for
+// receiving on this board.
+//
+// C3_CARRIER_HALF_US is the half-period minus the per-edge cost of
+// digitalWrite/delayMicroseconds. 38kHz wants a 26.3us period, i.e. 13.2us
+// per half; the overhead is roughly 2us of that, hence 11. If range turns
+// out poor, this is the number to nudge - too high and the carrier drifts
+// below what the receiver's bandpass will accept.
+#ifndef C3_CARRIER_HALF_US
+#define C3_CARRIER_HALF_US 11
+#endif
+
+void c3Mark(uint32_t us) {
+  uint32_t end = micros() + us;
+  while ((int32_t)(end - micros()) > 0) {
+    digitalWrite(SEND_PIN, HIGH);
+    delayMicroseconds(C3_CARRIER_HALF_US);
+    digitalWrite(SEND_PIN, LOW);
+    delayMicroseconds(C3_CARRIER_HALF_US);
+  }
+}
+
+void c3Space(uint32_t us) {
+  digitalWrite(SEND_PIN, LOW);
+  // delayMicroseconds is only good to ~16ms; gaps between frames exceed
+  // that, so long spaces are split rather than silently wrapping
+  while (us > 10000) { delayMicroseconds(10000); us -= 10000; }
+  if (us) delayMicroseconds(us);
+}
+
+// raw captures alternate mark/space and always start with a mark
+void c3SendRawSoft(const uint16_t *durations, uint16_t len) {
+  for (uint16_t i = 0; i < len; i++) {
+    if (i & 1) c3Space(durations[i]);
+    else       c3Mark(durations[i]);
+  }
+  digitalWrite(SEND_PIN, LOW);
+}
+
+// NEC: 9ms mark, 4.5ms space, 32 bits LSB-first (560us mark + 560us space
+// for 0, + 1690us space for 1), 560us stop. Matches IRremote's own choice
+// of classic vs extended framing: an address of 0xFF or less is sent as
+// address followed by its complement, anything larger as a 16-bit address.
+void c3SendNecSoft(uint16_t address, uint8_t command) {
+  uint32_t frame;
+  if (address <= 0xFF) {
+    frame = (uint32_t)(address & 0xFF)
+          | ((uint32_t)(~address & 0xFF) << 8)
+          | ((uint32_t)command << 16)
+          | ((uint32_t)(uint8_t)~command << 24);
+  } else {
+    frame = (uint32_t)(address & 0xFFFF)
+          | ((uint32_t)command << 16)
+          | ((uint32_t)(uint8_t)~command << 24);
+  }
+  c3Mark(9000);
+  c3Space(4500);
+  for (int i = 0; i < 32; i++) {
+    c3Mark(560);
+    c3Space((frame & (1UL << i)) ? 1690 : 560);
+  }
+  c3Mark(560);
+  digitalWrite(SEND_PIN, LOW);
+}
+#endif  // BOARD_C3KNOB
+
 void sendCode(const IRCode &code) {
   bool isProtocolEncoded = code.protocol.length() > 0;
 
@@ -371,11 +443,32 @@ void sendCode(const IRCode &code) {
   if (isProtocolEncoded) {
     Serial.printf("Sending %s code, address=%u command=%u\n",
                   code.protocol.c_str(), code.address, code.command);
+#ifdef BOARD_C3KNOB
+    {
+      String p = code.protocol;
+      p.toUpperCase();
+      if (p.indexOf("NEC") >= 0) {
+        c3SendNecSoft(code.address, (uint8_t)code.command);
+      } else {
+        // Only NEC is reimplemented on the software carrier so far. Say so
+        // rather than calling into IRremote, which is known not to
+        // transmit on this board - that would look like a working send
+        // that the target simply ignored.
+        Serial.println("C3: only NEC is supported on the software carrier");
+        updateScreen("Protocol not supported here");
+      }
+    }
+#else
     sendProtocolEncoded(code);
+#endif
   } else {
     Serial.print("Sending raw code, len=");
     Serial.println(code.len);
+#ifdef BOARD_C3KNOB
+    c3SendRawSoft(code.data, code.len);
+#else
     IrSender.sendRaw(code.data, code.len, 38);
+#endif
   }
 
   delay(40); // let the IR line settle
@@ -2726,7 +2819,11 @@ void handleIrTest() {
   } else {
     while (millis() < until) {
       esp_task_wdt_reset();
+#ifdef BOARD_C3KNOB
+      c3SendNecSoft(0x0707, 0x02);   // software carrier - what this board now uses
+#else
       IrSender.sendNEC(0x0707, 0x02, 0);
+#endif
       count++;
       delay(40);
     }
@@ -2747,8 +2844,8 @@ void handleIrTest() {
   out += "Try in this order:\n";
   out += "  /irtest?mode=high      steady light => emitter is active-HIGH\n";
   out += "  /irtest?mode=low       steady light => emitter is active-LOW\n";
-  out += "  /irtest?mode=carrier   light here but not on nec => IRremote is the problem\n";
-  out += "  /irtest?mode=nec       light here => emitter and IRremote are both fine\n\n";
+  out += "  /irtest?mode=carrier   raw 38kHz, no protocol\n";
+  out += "  /irtest?mode=nec       real NEC frames - should now light too\n\n";
   out += "If high AND low AND carrier are all dark, nothing is reaching the\n";
   out += "emitter at all - jumper position, or the LED needs a driver the\n";
   out += "GPIO alone can't supply.\n";
