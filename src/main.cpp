@@ -3945,6 +3945,7 @@ const unsigned long C3_ENC_MIN_GAP_MS = 5;   // contact-bounce floor
 enum C3Screen { C3_HOME, C3_MENU, C3_REMOTES, C3_LEARN, C3_SCAN };
 C3Screen c3Screen = C3_HOME;
 int c3Sel = 0;               // selection index within the current screen
+int c3HomeSel = 0;           // Home's selection, preserved while in the menu
 int c3ScanIdx = 0;           // which brand the blind scan is sitting on
 
 lv_obj_t *c3ScrRoot = NULL;
@@ -4249,9 +4250,9 @@ void c3OnShortPress() {
         break;
       }
       case 2: {
-        // "Learn this" refers to whatever Home had selected, so remember
-        // it before the menu overwrote c3Sel
-        int bi = c3RealButtonIndex(0);
+        // "Learn this" means the button Home was showing - c3Sel now holds
+        // the menu position, so use the saved Home index instead
+        int bi = c3RealButtonIndex(c3HomeSel);
         if (bi >= 0) { teachAllActive = false; if (startButtonLearn(bi)) c3ShowScreen(C3_LEARN); }
         break;
       }
@@ -4264,6 +4265,7 @@ void c3OnShortPress() {
     ensureRemoteValid();
     markProfileDirty();
     updateScreen("Remote: " + remotes[currentRemote].name);
+    c3HomeSel = 0;            // different remote, old index means nothing
     c3ShowScreen(C3_HOME);
 
   } else if (c3Screen == C3_SCAN) {
@@ -4277,7 +4279,7 @@ void c3OnShortPress() {
 }
 
 void c3OnLongPress() {
-  if (c3Screen == C3_HOME) c3ShowScreen(C3_MENU);
+  if (c3Screen == C3_HOME) { c3HomeSel = c3Sel; c3ShowScreen(C3_MENU); }
   else if (c3Screen == C3_LEARN) { stopTeachAll("Learn cancelled"); c3ShowScreen(C3_HOME); }
   else c3ShowScreen(C3_HOME);
 }
@@ -4318,7 +4320,17 @@ void c3Task() {
   if (a != c3LastA) {
     if (a == LOW && now - c3LastEncAt > C3_ENC_MIN_GAP_MS) {
       c3LastEncAt = now;
-      c3OnRotate(digitalRead(ENC_B_PIN) == HIGH ? 1 : -1);
+      // if the screensaver blanked the panel, the first input only wakes
+      // it - otherwise you'd be scrolling or firing a code blind. Nothing
+      // else on this board could wake it, since the wake path lived in the
+      // CYD touch poll.
+      if (screenAsleep) {
+        screenAsleep = false;
+        lastActivityAt = now;
+        tft.setBrightness(SCREEN_BRIGHTNESS);
+      } else {
+        c3OnRotate(digitalRead(ENC_B_PIN) == HIGH ? 1 : -1);
+      }
     }
     c3LastA = a;
   }
@@ -4334,7 +4346,13 @@ void c3Task() {
     c3OnLongPress();
   } else if (!down && c3SwDown) {
     c3SwDown = false;
-    if (!c3SwLongFired) c3OnShortPress();
+    if (screenAsleep) {
+      screenAsleep = false;
+      lastActivityAt = now;
+      tft.setBrightness(SCREEN_BRIGHTNESS);
+    } else if (!c3SwLongFired) {
+      c3OnShortPress();
+    }
   }
 
   lv_timer_handler();
@@ -4539,6 +4557,12 @@ void loop() {
       if (currentCydScreen == CYD_LEARN && !advanced) cydShowScreen(CYD_HOME);
       else if (advanced) cydDrawLearn();
 #endif
+#ifdef BOARD_C3KNOB
+      // without this the knob UI would sit on "Point & press" forever
+      // after a successful capture
+      if (c3Screen == C3_LEARN && !advanced) c3ShowScreen(C3_HOME, c3HomeSel);
+      else if (advanced) c3Render();
+#endif
     } else {
       // not learning - just note that a signal came in
       updateScreen("Signal seen");
@@ -4589,6 +4613,9 @@ void loop() {
     }
 #ifdef BOARD_CYD
     if (currentCydScreen == CYD_LEARN) cydShowScreen(CYD_HOME);
+#endif
+#ifdef BOARD_C3KNOB
+    if (c3Screen == C3_LEARN) c3ShowScreen(C3_HOME, c3HomeSel);
 #endif
   }
 
