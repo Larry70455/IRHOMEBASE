@@ -57,7 +57,14 @@ public:
       cfg.pin_bl = 5;
       cfg.invert = false;
       cfg.freq   = 44100;
-      cfg.pwm_channel = 0;   // C3 has fewer LEDC channels than the S3
+      // NOT channel 0: IRremote drives the 38kHz IR carrier on LEDC
+      // channel 0 (SEND_LEDC_CHANNEL, see its IRTimer.hpp). Sharing it
+      // meant every transmission reconfigured that channel to 38kHz and
+      // reattached it to the IR pin, stripping the backlight of its PWM -
+      // the screen went dark on the first blast. The C3 has 6 LEDC
+      // channels (0-5); 5 is the furthest from the low-numbered ones the
+      // Arduino 3.x auto-allocating ledcAttach() hands out first.
+      cfg.pwm_channel = 5;
       _light_instance.config(cfg);
       _panel_instance.setLight(&_light_instance);
     }
