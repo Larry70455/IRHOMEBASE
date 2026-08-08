@@ -2664,33 +2664,74 @@ void handleRemoteColumns() {
   finishRequest();
 }
 
-// /irtest[?secs=N] - transmits continuously for a few seconds so the IR
-// LED can be checked with a phone camera (phone sensors see IR; eyes
-// don't). This is the fastest way to split "the firmware isn't sending"
-// from "the emitter isn't lit" from "it's lit but the target ignores it",
-// which is otherwise guesswork.
+// /irtest?mode=X[&secs=N] - IR emitter diagnostics.
+//
+// Espressif's user guide confirms IO4 is the shared IR_RX/IR_TX line and
+// the emitter is an IR67-21CTR8, but it does not document the drive
+// polarity or whether there's a driver stage. These modes settle that by
+// experiment instead of assumption, and each one removes a layer:
+//
+//   mode=high     hold the pin HIGH  - lights an active-high emitter solid
+//   mode=low      hold the pin LOW   - lights an active-low emitter solid
+//   mode=carrier  bit-banged 38kHz square wave, no IRremote involved
+//   mode=nec      (default) real NEC frames through IRremote
+//
+// Watch the emitter with a phone camera during each. The first mode that
+// produces light tells us what the hardware actually wants, and whether
+// IRremote is the thing that's failing.
 void handleIrTest() {
+  String mode = server.hasArg("mode") ? server.arg("mode") : "nec";
   int secs = server.hasArg("secs") ? server.arg("secs").toInt() : 3;
   if (secs < 1) secs = 1;
   if (secs > 10) secs = 10;   // capped: this blocks the loop while it runs
 
-  Serial.printf("IR test: transmitting for %ds on pin %d\n", secs, SEND_PIN);
-  updateScreen("IR test blasting");
+  Serial.printf("IR test: mode=%s for %ds on GPIO%d\n", mode.c_str(), secs, SEND_PIN);
+  updateScreen("IR test: " + mode);
+
+  suppressReceive = true;
+  IrReceiver.stop();
+  // take the pin away from any peripheral that still holds it, so a plain
+  // digitalWrite actually reaches the pad
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcDetach(SEND_PIN);
+#else
+  ledcDetachPin(SEND_PIN);
+#endif
+  pinMode(SEND_PIN, OUTPUT);
 
   unsigned long until = millis() + (unsigned long)secs * 1000UL;
-  int frames = 0;
-  while (millis() < until) {
-    esp_task_wdt_reset();      // this loop can outrun the watchdog otherwise
-    suppressReceive = true;
-    IrReceiver.stop();
-#ifdef BOARD_C3KNOB
-    pinMode(SEND_PIN, OUTPUT);
+  long count = 0;
+
+  if (mode == "high" || mode == "low") {
+    digitalWrite(SEND_PIN, mode == "high" ? HIGH : LOW);
+    while (millis() < until) { esp_task_wdt_reset(); delay(50); }
     digitalWrite(SEND_PIN, LOW);
-#endif
-    IrSender.sendNEC(0x0707, 0x02, 0);   // arbitrary well-formed NEC frame
-    frames++;
-    delay(40);
+    count = 1;
+
+  } else if (mode == "carrier") {
+    // ~38kHz square wave by hand: 13us high, 13us low. Not a valid IR
+    // protocol, just enough modulation to light the emitter visibly.
+    while (millis() < until) {
+      esp_task_wdt_reset();
+      for (int i = 0; i < 2000; i++) {      // ~52ms of carrier per batch
+        digitalWrite(SEND_PIN, HIGH);
+        delayMicroseconds(13);
+        digitalWrite(SEND_PIN, LOW);
+        delayMicroseconds(13);
+      }
+      count++;
+    }
+    digitalWrite(SEND_PIN, LOW);
+
+  } else {
+    while (millis() < until) {
+      esp_task_wdt_reset();
+      IrSender.sendNEC(0x0707, 0x02, 0);
+      count++;
+      delay(40);
+    }
   }
+
 #ifdef BOARD_C3KNOB
   pinMode(RECV_PIN, INPUT);    // hand the shared pin back to the receiver
 #endif
@@ -2698,16 +2739,19 @@ void handleIrTest() {
   IrReceiver.resume();
   suppressReceive = false;
 
-  Serial.printf("IR test: sent %d frames\n", frames);
+  Serial.printf("IR test: mode=%s done (%ld units)\n", mode.c_str(), count);
   updateScreen("IR test done");
 
-  String out = "Sent " + String(frames) + " NEC frames over " + String(secs) + "s on GPIO" + String(SEND_PIN) + ".\n\n";
-  out += "Point a phone camera at the IR LED while this runs - a working\n";
-  out += "emitter shows as a flickering pale/purple dot on the screen.\n\n";
-  out += "Lit  -> the emitter works; the target device just isn't accepting\n";
-  out += "        this code (wrong protocol/brand, or out of range/angle).\n";
-  out += "Dark -> nothing is reaching the LED: check the jumper, the LED\n";
-  out += "        polarity, and that RX isn't loading the line (see below).\n";
+  String out = "mode=" + mode + "  secs=" + String(secs) + "  GPIO" + String(SEND_PIN) + "  units=" + String(count) + "\n\n";
+  out += "Watch the emitter with a PHONE CAMERA during each run.\n\n";
+  out += "Try in this order:\n";
+  out += "  /irtest?mode=high      steady light => emitter is active-HIGH\n";
+  out += "  /irtest?mode=low       steady light => emitter is active-LOW\n";
+  out += "  /irtest?mode=carrier   light here but not on nec => IRremote is the problem\n";
+  out += "  /irtest?mode=nec       light here => emitter and IRremote are both fine\n\n";
+  out += "If high AND low AND carrier are all dark, nothing is reaching the\n";
+  out += "emitter at all - jumper position, or the LED needs a driver the\n";
+  out += "GPIO alone can't supply.\n";
   server.send(200, "text/plain", out);
 }
 
