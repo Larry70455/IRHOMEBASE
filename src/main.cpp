@@ -330,6 +330,33 @@ void sendProtocolEncoded(const IRCode &code) {
   }
 }
 
+#ifdef BOARD_C3KNOB
+// IO8 drives both the IR carrier and the board's addressable RGB LED.
+// A WS2812 latches whatever it last decoded and holds it, so the garbage
+// it reads out of a 38kHz carrier stays lit indefinitely - just releasing
+// the pin low doesn't clear it, the part has to be sent a real frame.
+//
+// FastLED is already linked into this build (CRGB is used throughout), so
+// this uses it rather than hand-rolling WS2812 bit timing, which is
+// cycle-sensitive and would be far easier to get subtly wrong.
+//
+// Registering lazily rather than in setup(): IRremote reconfigures this
+// pin on every transmission, so there is no point owning it before the
+// first send. The two alternate - IRremote takes the pin via LEDC to
+// transmit, FastLED takes it back via RMT to blank the LED.
+CRGB c3SharedLed[1];
+bool c3SharedLedReady = false;
+
+void c3ClearSharedLed() {
+  if (!c3SharedLedReady) {
+    FastLED.addLeds<WS2812, SEND_PIN, GRB>(c3SharedLed, 1);
+    c3SharedLedReady = true;
+  }
+  c3SharedLed[0] = CRGB::Black;
+  FastLED.show();
+}
+#endif
+
 void sendCode(const IRCode &code) {
   bool isProtocolEncoded = code.protocol.length() > 0;
 
@@ -372,8 +399,7 @@ void sendCode(const IRCode &code) {
 #else
   ledcDetachPin(SEND_PIN);
 #endif
-  pinMode(SEND_PIN, OUTPUT);
-  digitalWrite(SEND_PIN, LOW);
+  c3ClearSharedLed();   // blank the RGB LED sharing this pin
 #endif
 
   IrReceiver.restartTimer();
